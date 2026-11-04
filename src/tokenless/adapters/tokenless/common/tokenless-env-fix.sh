@@ -619,7 +619,11 @@ fix_tool_from_spec() {
 
   # Collect all dep entries from required + recommended
   local all_deps
-  all_deps=$(echo "$tool_spec" | jq -c --arg mgr "$PACKAGE_MANAGER" '[(.required // []) + (.recommended // []) | .[] | if type == "string" then (if test("[>=<]") then {binary: (split("[>=<]") | .[0]), version: (capture("[>=<]+[0-9.]+"; "g") | .[0]), package: (split("[>=<]") | .[0]), manager: $mgr} else {binary: ., package: ., manager: $mgr} end) else . end]' 2>/dev/null || echo '[]')
+  # Split the constraint off with sub(), not split(): jq's split() takes a
+  # literal separator, so "[>=<]" never matched and the whole "rtk>=0.35" stayed
+  # in the name, which validate_name() then rejects. capture() needs named
+  # groups, so it returned null and the constraint was dropped as well.
+  all_deps=$(echo "$tool_spec" | jq -c --arg mgr "$PACKAGE_MANAGER" '[(.required // []) + (.recommended // []) | .[] | if type == "string" then (if test("[>=<]") then (sub("[>=<].*$"; "") as $name | {binary: $name, version: (sub("^[^>=<]*"; "")), package: $name, manager: $mgr}) else {binary: ., package: ., manager: $mgr} end) else . end]' 2>/dev/null || echo '[]')
 
   local count
   count=$(echo "$all_deps" | jq 'length' 2>/dev/null || echo 0)
