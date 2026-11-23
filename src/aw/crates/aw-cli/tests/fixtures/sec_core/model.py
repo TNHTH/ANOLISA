@@ -18,12 +18,16 @@ def model_server(case):
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             tools = [item["function"]["name"] for item in body.get("tools", [])]
-            seen = any(item["role"] == "tool" for item in body["messages"])
+            # Tests reusing a Session assign each turn a distinct native call ID.
+            identity = case / "tool-call-id.txt"
+            call_id = identity.read_text() if identity.exists() else "call_aw_acceptance"
+            seen = any(item["role"] == "tool" and item.get("tool_call_id") == call_id
+                       for item in body["messages"])
             with (case / "model-requests.jsonl").open("a") as output:
                 output.write(
                     json.dumps(
                         {
-                            "tools": tools,
+                            "tools": tools, "messages": body["messages"],
                             "tool_result_seen": seen,
                             "stream": body.get("stream"),
                             "tool_results": [m for m in body["messages"] if m["role"] == "tool"],
@@ -31,7 +35,13 @@ def model_server(case):
                     )
                     + "\n"
                 )
-            if not seen:
+            delay = case / "model-delay-seconds"
+            if delay.exists() and not seen:
+                time.sleep(float(delay.read_text()))
+            if (case / "plain-reply.txt").exists():
+                delta = {"role": "assistant", "content": (case / "plain-reply.txt").read_text()}
+                finish = "stop"
+            elif not seen:
                 request_path = case / "tool-call.json"
                 tool = json.loads(request_path.read_text()) if request_path.exists() else {
                     "name": "execute_shell_command",
@@ -45,7 +55,7 @@ def model_server(case):
                     "tool_calls": [
                         {
                             "index": 0,
-                            "id": "call_aw_acceptance",
+                            "id": call_id,
                             "type": "function",
                             "function": {
                                 "name": tool["name"],

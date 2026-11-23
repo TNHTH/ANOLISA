@@ -20,7 +20,7 @@ import {
   handleStatus,
   handleConfig,
 } from "../handlers.js";
-import { pluginState, UNAVAILABLE_MSG } from "../state.js";
+import { pluginState, UNAVAILABLE_MSG, takeRollbackWorkspaces } from "../state.js";
 import { CrontabManager } from "../cron.js";
 import type { BtrfsManager } from "../btrfs-manager.js";
 
@@ -136,6 +136,7 @@ describe("handlers — validation", () => {
     mockManager = {
       createCheckpoint: vi.fn(),
       rollback: vi.fn(),
+      getWorkspacePath: vi.fn().mockReturnValue("/ws"),
       listCheckpoints: vi.fn(),
       execDiffRaw: vi.fn(),
       getStatus: vi.fn(),
@@ -150,7 +151,7 @@ describe("handlers — validation", () => {
     pluginState.manager = origManager;
     pluginState.environmentReady = origReady;
     pluginState.resolvedConfig = origConfig;
-    pluginState.skipNextAutoCheckpoint = false;
+    pluginState.rollbackWorkspacesBySession.clear();
   });
 
   it("handleCheckpoint requires id", async () => {
@@ -194,41 +195,41 @@ describe("handlers — validation", () => {
       target: "snap1",
       message: "Rolled back to snap1",
     });
-    const r = await handleRollback("snap1");
+    const r = await handleRollback("snap1", undefined, undefined, false, { sessionKey: "test" });
     expect(r.isError).toBe(false);
     expect(r.text).toContain("snap1");
   });
 
-  it("handleRollback sets skipNextAutoCheckpoint on success", async () => {
+  it("handleRollback records the restored workspace on success", async () => {
     mockManager.rollback.mockResolvedValue({
       success: true,
       target: "snap1",
       message: "Rolled back to snap1",
     });
-    pluginState.skipNextAutoCheckpoint = false;
-    await handleRollback("snap1");
-    expect(pluginState.skipNextAutoCheckpoint).toBe(true);
+    pluginState.rollbackWorkspacesBySession.clear();
+    await handleRollback("snap1", undefined, undefined, false, { sessionKey: "test" });
+    expect(takeRollbackWorkspaces({ sessionKey: "test" })).toEqual(new Set(["/ws"]));
   });
 
-  it("handleRollback does not set skipNextAutoCheckpoint on preview", async () => {
+  it("handleRollback does not record a restored workspace on preview", async () => {
     mockManager.rollback.mockResolvedValue({
       success: true,
       target: "snap1",
       message: "Preview",
     });
-    pluginState.skipNextAutoCheckpoint = false;
-    await handleRollback("snap1", undefined, undefined, true);
-    expect(pluginState.skipNextAutoCheckpoint).toBe(false);
+    pluginState.rollbackWorkspacesBySession.clear();
+    await handleRollback("snap1", undefined, undefined, true, { sessionKey: "test" });
+    expect(takeRollbackWorkspaces({ sessionKey: "test" })).toBeUndefined();
   });
 
-  it("handleRollback does not set skipNextAutoCheckpoint on failure", async () => {
+  it("handleRollback does not record a restored workspace on failure", async () => {
     mockManager.rollback.mockResolvedValue({
       success: false,
       message: "failed",
     });
-    pluginState.skipNextAutoCheckpoint = false;
-    await handleRollback("snap1");
-    expect(pluginState.skipNextAutoCheckpoint).toBe(false);
+    pluginState.rollbackWorkspacesBySession.clear();
+    await handleRollback("snap1", undefined, undefined, false, { sessionKey: "test" });
+    expect(takeRollbackWorkspaces({ sessionKey: "test" })).toBeUndefined();
   });
 
   it("handleListCheckpoints empty", async () => {
@@ -321,6 +322,7 @@ describe("handlers — explicit workspace", () => {
     pluginState.manager = {
       createCheckpoint: vi.fn(),
       rollback: vi.fn(),
+      getWorkspacePath: vi.fn().mockReturnValue("/ws"),
       listCheckpoints: vi.fn(),
       getStore: vi.fn().mockReturnValue({ remove: vi.fn() }),
       execDiffRaw: vi.fn(),
@@ -439,7 +441,7 @@ describe("handlers — explicit workspace", () => {
   // --- rollback cwd inside default workspace ---
   it("rollback cwd inside default workspace", async () => {
     process.cwd = () => "/ws/sub";
-    const r = await handleRollback("snap1");
+    const r = await handleRollback("snap1", undefined, undefined, false, { sessionKey: "test" });
     expect(r.isError).toBe(true);
     expect(r.text).toContain("Refused");
   });
@@ -881,6 +883,7 @@ describe("handleRollback — numAncestors", () => {
 
     mockManager = {
       rollback: vi.fn(),
+      getWorkspacePath: vi.fn().mockReturnValue("/ws"),
     };
     pluginState.manager = mockManager as unknown as BtrfsManager;
     pluginState.environmentReady = true;
@@ -899,22 +902,33 @@ describe("handleRollback — numAncestors", () => {
     expect(r.text).toContain("mutually exclusive");
   });
 
-  it("numAncestors < 1 returns error", async () => {
-    const r = await handleRollback(undefined, undefined, 0);
-    expect(r.isError).toBe(true);
-    expect(r.text).toContain(">= 1");
+  it.each(["", "   ", "\t", "true", 0, null])("rejects invalid preview %j before rollback", async (preview) => {
+    mockManager.rollback.mockResolvedValue({ success: true, message: "rolled back" });
+    const result = await handleRollback("snap1", undefined, undefined, preview as unknown as boolean);
+    expect(result).toEqual({ text: "'preview' must be a boolean", isError: true });
+    expect(mockManager.getWorkspacePath).not.toHaveBeenCalled();
+    expect(mockManager.rollback).not.toHaveBeenCalled();
+    expect(promisifiedMock).not.toHaveBeenCalled();
   });
 
-  it("numAncestors NaN returns error", async () => {
-    const r = await handleRollback(undefined, undefined, NaN);
-    expect(r.isError).toBe(true);
-    expect(r.text).toContain(">= 1");
-  });
-
-  it("numAncestors Infinity returns error", async () => {
-    const r = await handleRollback(undefined, undefined, Infinity);
-    expect(r.isError).toBe(true);
-    expect(r.text).toContain(">= 1");
+  describe.each([
+    { workspace: undefined, preview: false },
+    { workspace: undefined, preview: true },
+    { workspace: "/explicit", preview: false },
+    { workspace: "/explicit", preview: true },
+  ])("workspace=$workspace preview=$preview", ({ workspace, preview }) => {
+    it.each([
+      1.5, 2.9, true, false, "2", "2.0", null, {}, [], NaN, Infinity, -Infinity, 0, -1,
+    ].map((numAncestors) => ({ numAncestors })))(
+      "rejects invalid depth $numAncestors without invoking rollback",
+      async ({ numAncestors }) => {
+        const r = await handleRollback(undefined, workspace, numAncestors as number, preview);
+        expect(r).toEqual({ text: "'numAncestors' must be an integer >= 1", isError: true });
+        expect(mockManager.getWorkspacePath).not.toHaveBeenCalled();
+        expect(mockManager.rollback).not.toHaveBeenCalled();
+        expect(promisifiedMock).not.toHaveBeenCalled();
+      },
+    );
   });
 
   it("no workspace returns error", async () => {
@@ -924,14 +938,16 @@ describe("handleRollback — numAncestors", () => {
     expect(r.text).toContain("No workspace");
   });
 
-  it("numAncestors via manager success", async () => {
+  it.each([1, 2, 10])("passes integer depth %i unchanged to the manager", async (numAncestors) => {
     mockManager.rollback.mockResolvedValue({
       success: true,
-      message: "Rolled back 2 steps",
+      message: "Rolled back",
     });
-    const r = await handleRollback(undefined, undefined, 2);
-    expect(r.isError).toBe(false);
-    expect(mockManager.rollback).toHaveBeenCalledWith(undefined, 2, false);
+    for (const preview of [false, true]) {
+      const r = await handleRollback(undefined, undefined, numAncestors, preview);
+      expect(r.isError).toBe(false);
+      expect(mockManager.rollback).toHaveBeenLastCalledWith(undefined, numAncestors, preview);
+    }
   });
   it("update workspace rejects line breaks", async () => {
     const migrateSpy = vi.spyOn(CrontabManager, "migrate").mockResolvedValue([]);

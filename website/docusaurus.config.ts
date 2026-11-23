@@ -9,7 +9,7 @@ const baseUrl = process.env.BASE_URL ?? '/';
 
 const config: Config = {
   title: 'ANOLISA',
-  tagline: 'The operating layer for agent workloads',
+  tagline: 'A multi-component system software stack for AI Agent workloads.',
   url: siteUrl,
   baseUrl,
   organizationName: 'agentic-os-org',
@@ -72,7 +72,9 @@ const config: Config = {
           sidebarPath: './sidebars.ts',
           async sidebarItemsGenerator({defaultSidebarItemsGenerator, ...args}) {
             const items = await defaultSidebarItemsGenerator(args);
-            if (/^user-guide\/[^/]+$/.test(args.item.dirName)) {
+            // Keep AW's first-use walkthrough visible as its first chapter.
+            if (/^user-guide\/[^/]+$/.test(args.item.dirName)
+              && args.item.dirName !== 'user-guide/aw') {
               // The component category already links to its manual entry.
               return items.filter((item) => item.type !== 'doc' || item.id !== `${args.item.dirName}/index`);
             }
@@ -93,7 +95,7 @@ const config: Config = {
       {
         name: 'description',
         content:
-          'ANOLISA is a local-first operating layer for building, running, securing, and observing agent workloads.',
+          'ANOLISA is a multi-component system software stack providing context management, Skills delivery, workspace recovery, security, and observability for AI Agent applications, frameworks, and platforms.',
       },
     ],
     colorMode: {

@@ -18,6 +18,7 @@ operations, Stash retrieval, environment status, and statistics. Shared Agent ho
 | `tokenless retrieve` | Recover a payload truncated into Stash |
 | `tokenless env-check` | Report the hard-disabled state of the legacy environment check |
 | `tokenless stats` | Query and control local statistics |
+| `tokenless rtk` | Run the bundled RTK commands that PreTool rewrites to; see [Bundled RTK commands](#bundled-rtk-commands) |
 
 Use the installed version's help as the final argument reference:
 
@@ -120,11 +121,20 @@ Operations:
 
 `post_tool` is the only operation that enters `PostToolPipeline`. Current production routing is:
 
-- Retrieve results, interrupted or denied calls, and RTK-optimized output bypass compression.
+- Retrieve results and interrupted or denied calls bypass compression.
+- RTK output bypasses compression unless complete execution receipts confirm unchanged bytes and
+  the call succeeded. PostTool must supply the exact registered execution command in `command`;
+  a missing or modified command retains the bypass. Core restores the original command before routing. Changed or unconfirmed
+  output retains the bypass; a tied token estimate does not authorize fallback. Receipt-state
+  failures warn and retain the bypass without failing the PostTool operation.
 - Tool errors pass through unchanged and may include bounded `additional_context` diagnostics.
 - Successful JSON uses `JsonCompressor`; compact JSON or TOON may be selected.
-- Recognized successful build/test command output uses `BuildLogCompressor`; terminal cleanup and
-  recoverable routine-progress reduction may be selected.
+- Recognized successful build/test/package-install output uses `BuildLogCompressor`.
+  `terminal_cleanup` removes SGR colors. The existing `build_log_reduction` label covers
+  both pnpm layout compaction and routine-progress reduction, including combined results.
+  Layout-only output is semantically `lossless`, writes no Stash and remains eligible
+  with `recovery.kind = none`; progress omissions require recovery and report `retrievable`.
+  See [pnpm boundaries](index.md#pnpm-install-output).
 - Successful CSV/TSV uses `TabularCompressor` when the host supports arbitrary text replacement.
   Only complete, cell-preserving compaction is applied when both characters and estimated tokens
   decrease; otherwise the original passes through. No Stash or recovery capability is required.
@@ -139,52 +149,88 @@ transformations instead of a configured compressor list.
 `before_model` and `post_tool` require `capabilities.recovery`: `{"kind":"none"}`,
 `{"kind":"shell"}`, or `{"kind":"tool","name":"tokenless_retrieve"}`. Tool names contain
 1–64 ASCII letters, digits, underscores, or hyphens. Unknown fields, missing recovery, and the former
-`retrieval_available` boolean are rejected; update Core and callers together. The protocol version
-remains 2. Only a static Tool enables recoverable BeforeModel schema truncation; shell recovery
-applies to PostTool and does not add or change Agent tools.
+`retrieval_available` boolean are rejected. The wire version remains 2; BuildLog uses
+existing operation labels and adds no SDK enum. Only a static Tool enables recoverable
+BeforeModel schema truncation; shell recovery applies to PostTool and does not add
+or change Agent tools.
 
 Exit codes are part of the transport contract:
 
 - `0`: a normal operation result, including passthrough, no savings, dry-run, unavailable
   recoverability, RTK not applicable, and tool errors.
-- `1`: an operation failed, including RTK timeout, unauthorized or missing Retrieve, Stash failure,
-  or Pipeline failure. The error is written to stderr and no response JSON is emitted.
+- `1`: an operation failed, including a missing RTK launcher or state directory, unauthorized or
+  missing Retrieve, Stash failure, or Pipeline failure. The error is written to stderr and no response JSON is emitted.
 - `2`: malformed JSON, unsupported protocol version, or an invalid envelope/payload shape.
 
-The `pre_tool` operation resolves the separately packaged `rtk` executable from `PATH` and supported
-install layouts, skipping candidates older than 0.35.0 before trying the next packaged location.
-Recognized Cargo, pytest, npm/Jest, Go, and Make build/test commands, plus entire commands containing
-a recognized native `find` invocation, stay native so their output has a single PostTool owner.
-The `find` protection covers direct calls and RTK's built-in prefixes: `env`, `command`, `exec`,
+A `pre_tool` rewrite has 5 seconds, because RTK can wait on `git` without a limit. On timeout
+`compress` writes the error to stderr, emits no response JSON and exits `1`, and the processes RTK
+started, such as a stalled `git`, end with the rewrite. On Linux and macOS the rewrite runs in a
+child `tokenless` process that leads a process group of its own, so a timeout never signals the
+caller's other processes. The 5 seconds cover everything the child does after it reads the request,
+including opening the configuration and stores, so a caller that stops only `compress` leaves the
+child and the processes it started running for at most that long. On Windows the rewrite runs inside
+a job object that ends with `compress`, so a caller that stops `compress` also stops the processes
+RTK started. If `compress` cannot set up that process group or job, it writes the error to stderr
+and exits `1` without running RTK.
+
+The `pre_tool` operation rewrites commands with the RTK library linked into Tokenless; it does not
+search `PATH` for a separate `rtk` executable. Rewritten commands call the running `tokenless`
+executable by its absolute path as `tokenless rtk`, so they always run the same RTK version.
+Recognized Cargo, pytest, npm/Jest, Go, and Make build/test commands stay native so their output has
+a single PostTool owner. Entire commands containing a recognized native `find`, `head`, `tail`, `grep`, or `rg`
+invocation also stay native. The protection covers direct calls and RTK's built-in prefixes:
+`env`, `command`, `exec`,
 `noglob`, `nocorrect`, `builtin`, `timeout`, `time`, `nice`, `nohup`, and `uv run`, including nesting
 and shell backslash-newline continuations. Process-wrapper options follow the bundled RTK grammar;
 unknown options stop recognition. This remains true when `TOKENLESS_SEARCH_PATH_SHARING_ENABLED=0`.
-Custom `hooks.transparent_prefixes` are not inspected and may still let RTK rewrite wrapped `find`;
+Custom `hooks.transparent_prefixes` are not inspected and may still let RTK rewrite wrapped calls;
 other supported commands may also be rewritten.
+
+`head` and `tail` retain their native execution semantics for all arguments, including byte windows
+and follow mode. If a recognized call appears in a pipeline or compound command, the entire command
+bypasses rewriting. This avoids RTK's `head` → `read --max-lines` structural truncation, which can
+omit function bodies inside the requested line window. Explicit `rtk` commands remain explicit.
+This PreTool rule does not disable eligible PostTool compression; file-read policy is unchanged.
+Recognized `grep` and `rg` calls keep all modes native and use only the search compressor in
+PostTool. Disabled search compression, unsupported formats, and no savings preserve the output,
+including with `force_json`.
+
+The same protection covers the complete output of compound commands containing a recognized
+search, including `grep -q needle Cargo.toml && cargo build`: mixed build/test logs currently
+remain unchanged because output boundaries between commands are unavailable. This can produce
+larger results than the previous log-compression route. Tokenless does not truncate these
+results; only host output limits apply. `git grep`, `xargs grep`, and custom wrapper prefixes
+are outside the native grep/rg recognition described here.
+
 Agent-facing `retrieve` authorizes the requested hash against `visible_markers` before reading Stash.
 The standalone `tokenless retrieve` command below is a separate trusted local operations path and
 does not require model-visibility context.
 
 ## Bundled RTK commands
 
-Tokenless bundles RTK 0.49.0. The behavior below applies to that binary; a compatible
-`rtk` found earlier on `PATH` can be a different version. Check `rtk --version` when
-using these commands directly.
+Tokenless links RTK 0.49.0 and exposes its commands as `tokenless rtk`. The behavior
+below applies to that subcommand; a separately installed `rtk` on `PATH` can be a
+different version. Check `tokenless rtk --version` to confirm the bundled version.
+
+A `--` before the command is the end-of-options delimiter: Tokenless consumes it,
+so `tokenless rtk -- ls` runs the same command as `tokenless rtk ls` and
+`tokenless rtk -- --version` reports the bundled version. A `--` after the command
+name still reaches RTK unchanged, as in `tokenless rtk run -- echo hi`.
 
 ### Search flags
 
-`rtk grep` forwards native search flags to `grep`: `-l` lists matching file names,
+`tokenless rtk grep` forwards native search flags to `grep`: `-l` lists matching file names,
 and `-m N` limits matches per file. They no longer mean RTK's line-length or display
 limits. Use the long options `--max-len` and `--max` before the pattern to control
 those RTK display limits. The former RTK `-t` / `--file-type` option is removed;
-use `rtk rg -t rust` for ripgrep's native file-type filtering. Passing `-t` to
-`rtk grep` now exposes the underlying grep's unsupported-option error.
+use `tokenless rtk rg -t rust` for ripgrep's native file-type filtering. Passing `-t` to
+`tokenless rtk grep` now exposes the underlying grep's unsupported-option error.
 
 ```bash
-rtk grep -l 'TODO' src/*.rs
-rtk grep -m 3 'TODO' src/*.rs
-rtk grep --max 20 --max-len 120 'TODO' src/*.rs
-rtk rg -t rust 'TODO' src/
+tokenless rtk grep -l 'TODO' src/*.rs
+tokenless rtk grep -m 3 'TODO' src/*.rs
+tokenless rtk grep --max 20 --max-len 120 'TODO' src/*.rs
+tokenless rtk rg -t rust 'TODO' src/
 ```
 
 ### Shell rewriting
@@ -196,8 +242,8 @@ or `cat`. Pipelines that count or parse raw output may remain unchanged; rewriti
 is not guaranteed for every shell expression. `sudo` commands pass through unchanged,
 so automatic rewriting does not insert RTK into a privileged command.
 
-Use `rtk rewrite 'COMMAND'` to inspect a proposed rewrite without executing the
-command. Tokenless keeps its recognized build/test commands and recognized native `find` invocations,
+Use `tokenless rtk rewrite 'COMMAND'` to inspect a proposed rewrite without executing the
+command. Tokenless keeps its recognized build/test commands and native `find`, `head`, `tail`, `grep`, and `rg` calls,
 including whole compound commands containing such a call, outside RTK rewriting as described above. PostTool can
 share profitable pure path lists; mixed output and unsupported `find` formats remain native.
 
@@ -205,9 +251,9 @@ share profitable pure path lists; mixed output and unsupported `find` formats re
 
 With the default RTK configuration, supported filters store failure output of at
 least 500 bytes and explicitly truncated output in a local SQLite recovery store.
-When a recovery hint appears, run `rtk recall HASH` with the displayed hash;
-`rtk recall --full HASH` requests all stored output, and `--from`, `--lines`, and
-`--grep` narrow the result. `rtk recall --list` lists retained entries. Storage limits
+When a recovery hint appears, run `tokenless rtk recall HASH` with the displayed hash;
+`tokenless rtk recall --full HASH` requests all stored output, and `--from`, `--lines`, and
+`--grep` narrow the result. `tokenless rtk recall --list` lists retained entries. Storage limits
 and expiry apply, so recall is not a permanent archive. Existing legacy tee
 configuration continues to use its file-based recovery mode.
 
@@ -350,7 +396,17 @@ echo '{"name":"test","value":42}' \
   | tokenless decompress-toon
 ```
 
-`compress-toon` supports `--agent-id`, `--session-id`, `--tool-use-id`, and `--min-toon-chars`. When a payload is below the minimum length or encoding provides no savings, it returns the original JSON and does not record that operation. The exit code is still `0` in these passthrough cases, and the note on stderr is informational only: when scripting, detect whether encoding happened by comparing stdout with the input payload instead of relying on stderr. Passthrough and no-savings runs reproduce the input byte-for-byte on stdout (no trailing newline is added or stripped), so any byte difference means the payload was encoded; checking whether stdout is still valid JSON works as a fallback.
+Both commands accept the input as a file instead of standard input:
+
+```bash
+tokenless compress-toon --file payload.json
+tokenless decompress-toon --file payload.toon
+```
+
+`-f` is the short form of `--file`. Without it, the input is read from standard
+input, which is what the examples above use.
+
+`compress-toon` supports `--agent-id`, `--session-id`, `--tool-use-id`, and `--min-toon-chars`. When a payload is below the minimum length, holds a number TOON cannot carry exactly (`1e-400`, `-0.0`, `1e3`, or a decimal longer than an `f64`), or encoding provides no savings, it returns the original JSON and does not record that operation. The exit code is still `0` in these passthrough cases, and the note on stderr is informational only: when scripting, detect whether encoding happened by comparing stdout with the input payload instead of relying on stderr. Passthrough and no-savings runs reproduce the input byte-for-byte on stdout (no trailing newline is added or stripped), so any byte difference means the payload was encoded; checking whether stdout is still valid JSON works as a fallback.
 
 ## `retrieve`
 

@@ -5,7 +5,11 @@ pub(super) use aw_adapter::*;
 use aw_exec::{CommandSpec, PackageLeases};
 use aw_service::Binding;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -13,6 +17,10 @@ pub(super) struct HookBinding {
     pub adapter: String,
     #[serde(default)]
     pub reloadable: bool,
+    #[serde(default)]
+    pub resident_policy_reload: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration: Option<super::native::Registration>,
     pub binding: Binding,
     pub socket: PathBuf,
     pub cwd: PathBuf,
@@ -20,6 +28,12 @@ pub(super) struct HookBinding {
 }
 
 impl HookBinding {
+    pub(super) fn read(path: &str) -> Result<Self> {
+        Ok(serde_json::from_slice(&read_private_file(Path::new(
+            path,
+        ))?)?)
+    }
+
     pub(super) fn native_context(&self) -> NativeContext {
         NativeContext {
             target: self.binding.target.clone(),
@@ -29,7 +43,34 @@ impl HookBinding {
     }
 }
 
+pub(super) fn read_private_file(path: &Path) -> Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    // SAFETY: geteuid reads the process identity without changing it.
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o7777 != 0o600
+        || metadata.len() > 1024 * 1024
+    {
+        return Err("unsafe or oversized private hook file".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > 1024 * 1024 {
+        return Err("oversized private hook file".into());
+    }
+    Ok(bytes)
+}
+
 pub(super) fn install(args: &Arguments) -> Result<Exit> {
+    if args.flags.contains_key("--pid") || args.flags.contains_key("--remove") {
+        return super::attachment::install(args);
+    }
     args.check(&["--config", "--agent", "--native-profile"], false)?;
     let bytes = read_file(args.required("--config")?, 4 * 1024 * 1024)?;
     let config = aw_config::Validator::new()?.parse(&bytes)?;
@@ -83,7 +124,12 @@ pub(super) fn install(args: &Arguments) -> Result<Exit> {
         profile: args.flags.get("--native-profile").cloned(),
     };
     match adapter.install(&options, &config, &super::run::CANCELLED) {
-        Ok(()) => Ok(super::run::interrupted().unwrap_or(Exit::Code(0))),
+        Ok(()) => {
+            if name == "codex" {
+                println!("AW hooks installed. Open Codex /hooks and review all three AW command hooks. Installation does not grant trust.");
+            }
+            Ok(super::run::interrupted().unwrap_or(Exit::Code(0)))
+        }
         Err(error) => super::run::interrupted_error(error.into()),
     }
 }

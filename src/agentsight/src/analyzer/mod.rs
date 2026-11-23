@@ -27,11 +27,12 @@ pub use message::{
 
 // Re-export analysis result
 pub use result::{
-    AnalysisResult, HttpRecord, MessageTokenCount, OutputTokenCount, PromptTokenCount,
+    AnalysisResult, HttpContext, HttpRecord, MessageTokenCount, OutputTokenCount, PromptTokenCount,
     TokenConsumptionBreakdown,
 };
 
 // Re-export unified analyzer
+pub(crate) use unified::estimate_input_tokens;
 pub use unified::{
     Analyzer, RequestTokenCount, ResponseTokenCount, count_request_tokens, count_response_tokens,
 };

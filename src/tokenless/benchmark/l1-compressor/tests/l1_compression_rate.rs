@@ -58,6 +58,7 @@ fn pretty_response_canonical_compacts_without_omitting_values() {
                 allow_toon: false,
                 min_toon_chars: usize::MAX,
                 allow_unrecoverable: false,
+                embedded_html: false,
             },
         )
         .unwrap();
@@ -84,8 +85,9 @@ fn schema_canonical_savings_at_least_40_pct() {
 
 #[test]
 fn full_stack_savings_at_least_18_pct() {
-    // Measured 18.8% with preserved response values, down from 50.3% when
-    // diagnostic fields were deleted. Fixtures and stacking definitions match.
+    // Measured 19.5% with preserved response values and `toon-format` 0.7.0,
+    // down from 50.3% when diagnostic fields were deleted. Fixtures and
+    // stacking definitions match.
     let report = compression_metrics();
     let configs = report["stacking"]["configs"].as_array().unwrap();
     let full = configs

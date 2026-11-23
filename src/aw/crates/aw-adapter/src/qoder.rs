@@ -7,8 +7,7 @@ use super::{
     },
     read_file, Exit, Result,
 };
-use aw_provider::admission::AdapterCapabilities as Capabilities;
-use aw_provider::admission::AdmittedStep;
+use aw_core::admission::{AdapterCapabilities as Capabilities, AdmittedStep};
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
@@ -17,7 +16,7 @@ use std::{
 };
 
 pub(super) struct Qoder;
-mod reload;
+pub(crate) mod reload;
 
 struct Prepared {
     input: LaunchInput,
@@ -47,10 +46,11 @@ impl Adapter for Qoder {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         check_args(&native)?;
         let settings = settings(input.options.settings.as_ref())?;
-        check_sources(&input.command.cwd, &settings)?;
+        check_sources(&input.command.cwd, &settings, &input.command.environment)?;
         if input.options.reloadable {
             reload::check_sources(
                 &input.command.cwd,
+                &input.command.environment,
                 &settings,
                 input.document["spec"]["agents"][&input.target]["qoder"]["sequential"] == true,
             )?;
@@ -60,15 +60,9 @@ impl Adapter for Qoder {
         if version.is_empty() || version.len() > 128 {
             return Err("Qoder CLI version probe output must contain 1..128 bytes".into());
         }
-        let detected = semver::Version::parse(&version).map_err(|error| {
+        semver::Version::parse(&version).map_err(|error| {
             format!("could not parse Qoder CLI --version output; expected a bare SemVer such as 1.1.64, got {version:?}: {error}")
         })?;
-        let minimum = semver::Version::new(1, 1, 64);
-        if detected < minimum {
-            return Err(
-                format!("Qoder CLI {minimum} or newer is required (detected {version})").into(),
-            );
-        }
         Ok(Box::new(Prepared {
             input,
             settings,
@@ -96,7 +90,12 @@ impl Adapter for Qoder {
 
 impl PreparedLaunch for Prepared {
     fn capabilities(&self) -> Capabilities {
-        capabilities(&self.native, &self.version)
+        let mut capabilities = capabilities(&self.native, &self.version);
+        if self.input.options.reloadable {
+            capabilities.events.remove("session.start");
+            capabilities.events.remove("session.end");
+        }
+        capabilities
     }
 
     fn validate_steps(&self, steps: &[AdmittedStep]) -> Result<()> {
@@ -116,6 +115,35 @@ impl PreparedLaunch for Prepared {
             Path::new("/binding.json"),
         )?;
         Ok(())
+    }
+
+    fn attachment(
+        &mut self,
+        context: &LaunchContext<'_>,
+    ) -> Result<crate::attachment::Registration> {
+        if self.capabilities().entrypoint != "tui" {
+            return Err(
+                "running Qoder attachment requires the TUI; prepare startup Hooks for print mode"
+                    .into(),
+            );
+        }
+        crate::reload::supported(&self.capabilities())?;
+        let home = self
+            .input
+            .command
+            .environment
+            .get(std::ffi::OsStr::new("HOME"))
+            .ok_or("native HOME is required")?;
+        let settings = PathBuf::from(home).join(".qoder/settings.json");
+        let (groups, _) = reload::generate(
+            json!({}),
+            context.executable,
+            context.binding_path,
+            self.input.document["spec"]["agents"][&self.input.target]["qoder"]
+                .get("sequential")
+                .and_then(Value::as_bool),
+        )?;
+        crate::attachment::Registration::qoder(settings, groups, context)
     }
 
     fn configure(&mut self, context: &LaunchContext<'_>) -> Result<LaunchPlan> {
@@ -223,14 +251,6 @@ pub(super) fn check_args(args: &[String]) -> Result<()> {
             return Err(format!("Qoder option {name} is not supported by this launcher; use --native-settings for flag settings").into());
         }
     }
-    if std::env::var("QODER_HEADLESS_FAST_HOOKS").is_ok_and(|v| {
-        matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    }) {
-        return Err("QODER_HEADLESS_FAST_HOOKS disables native hooks".into());
-    }
     Ok(())
 }
 
@@ -256,17 +276,36 @@ pub(super) fn settings(path: Option<&String>) -> Result<Value> {
     Ok(value)
 }
 
-pub(super) fn check_sources(cwd: &Path, flags: &Value) -> Result<()> {
+pub(super) fn check_sources(
+    cwd: &Path,
+    flags: &Value,
+    environment: &BTreeMap<OsString, OsString>,
+) -> Result<()> {
+    if environment
+        .get(std::ffi::OsStr::new("QODER_HEADLESS_FAST_HOOKS"))
+        .is_some_and(|v| {
+            matches!(
+                v.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+    {
+        return Err("QODER_HEADLESS_FAST_HOOKS disables native hooks".into());
+    }
     for name in ["QODER_CONFIG_DIR_NAME", "QODERCN_CONFIG_DIR_NAME"] {
-        if std::env::var_os(name).is_some() {
+        if environment.contains_key(std::ffi::OsStr::new(name)) {
             return Err(format!("custom {name} is not supported by this adapter").into());
         }
     }
-    if std::env::var("QODERCLI_SITE").is_ok_and(|v| v == "cn") {
+    if environment
+        .get(std::ffi::OsStr::new("QODERCLI_SITE"))
+        .is_some_and(|v| v == "cn")
+    {
         return Err("QODERCLI_SITE=cn requires a separately verified adapter".into());
     }
-    let home =
-        std::env::var_os("HOME").ok_or("HOME is required to inspect native Qoder settings")?;
+    let home = environment
+        .get(std::ffi::OsStr::new("HOME"))
+        .ok_or("HOME is required to inspect native Qoder settings")?;
     for path in [
         PathBuf::from(home).join(".qoder/settings.json"),
         cwd.join(".qoder/settings.json"),
@@ -286,6 +325,9 @@ pub(super) fn check_sources(cwd: &Path, flags: &Value) -> Result<()> {
 
 pub(super) fn event_name(event: &str) -> Result<&'static str> {
     match event {
+        "session.start" => Ok("SessionStart"),
+        "session.end" => Ok("SessionEnd"),
+        "input.submit" => Ok("UserPromptSubmit"),
         "tool.before" => Ok("PreToolUse"),
         "tool.after" => Ok("PostToolUse"),
         _ => Err("unsupported native event".into()),
@@ -309,9 +351,16 @@ pub(super) fn generate(
         .or_insert_with(|| json!({}))
         .as_object_mut()
         .ok_or("Qoder hooks must be an object")?;
-    for name in ["tool.before", "tool.after"] {
-        let selected =
-            adapter::native_steps(steps, name, adapter::observation_enabled(document, target));
+    for name in [
+        "session.start",
+        "input.submit",
+        "tool.before",
+        "tool.after",
+        "session.end",
+    ] {
+        let observe = matches!(name, "tool.before" | "tool.after")
+            && adapter::observation_enabled(document, target);
+        let selected = adapter::native_steps(document, steps, name, observe);
         if selected.is_empty() {
             continue;
         }
@@ -335,16 +384,29 @@ pub(super) fn generate(
                 })
             })
             .collect();
-        let mut group = json!({"matcher": "*", "hooks": commands});
+        // Selector misses still require event validation and their configured failure audit.
+        let mut group = json!({"hooks": commands});
+        if name == "session.start" {
+            group["matcher"] = json!("startup|resume|clear|new");
+        } else if name != "session.end" {
+            group["matcher"] = json!("*");
+        }
         if let Some(sequential) = spec["agents"][target]["qoder"].get("sequential") {
             group["sequential"] = sequential.clone();
         }
-        hooks
-            .entry(event_name(name)?)
-            .or_insert_with(|| json!([]))
-            .as_array_mut()
-            .ok_or("Qoder event hooks must be arrays")?
-            .push(group);
+        let native_events: &[&str] = if name == "tool.after" {
+            &["PostToolUse", "PostToolUseFailure"]
+        } else {
+            &[event_name(name)?]
+        };
+        for native in native_events {
+            hooks
+                .entry(*native)
+                .or_insert_with(|| json!([]))
+                .as_array_mut()
+                .ok_or("Qoder event hooks must be arrays")?
+                .push(group.clone());
+        }
         events.insert(
             name.into(),
             HookEvent {
@@ -364,10 +426,26 @@ pub(super) fn generate(
 }
 
 pub(super) fn normalize(binding: &NativeContext, name: &str, native: &Value) -> Result<Value> {
-    if native["hook_event_name"] != event_name(name)?
+    let failure = name == "tool.after" && native["hook_event_name"] == "PostToolUseFailure";
+    if (!failure && native["hook_event_name"] != event_name(name)?)
         || native["cwd"].as_str() != binding.cwd.to_str()
     {
         return Err("Qoder callback event or working directory does not match the binding".into());
+    }
+    if matches!(name, "session.start" | "session.end") {
+        if name == "session.start" && native["source"] == "compact" {
+            return Err("Qoder compaction does not start a session".into());
+        }
+        return crate::adapters::lifecycle::normalize(binding, "qoder", name, native);
+    }
+    if name == "input.submit" {
+        return crate::adapters::submission::normalize_turn(
+            binding,
+            native,
+            "qoder",
+            "prompt",
+            "request_set_id",
+        );
     }
     let identifier = |key: &str| -> Result<&str> {
         native[key]
@@ -383,12 +461,204 @@ pub(super) fn normalize(binding: &NativeContext, name: &str, native: &Value) -> 
     if native.get("tool_input").is_none() {
         return Err("Qoder callback has no tool_input".into());
     }
+    let result = if failure {
+        if !native["error"].is_string() {
+            return Err("Qoder failure callback requires error".into());
+        }
+        json!({"is_error":true,"error":native["error"],"is_interrupt":native["is_interrupt"]})
+    } else {
+        native.get("tool_response").cloned().unwrap_or(Value::Null)
+    };
     Ok(json!({
         "name": name,
         "agent": {"adapter": "qoder", "binding_id": binding.target, "instance_id": binding.instance_id},
         "session_id": session,
         "tool": {"name": tool, "native_name": tool, "call_id": call,
-                 "input": native["tool_input"], "result": native.get("tool_response").cloned().unwrap_or(Value::Null)},
+                 "input": native["tool_input"], "result": result},
         "native": native,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_callbacks_keep_native_end_reason() {
+        let binding = NativeContext {
+            target: "qoder".into(),
+            instance_id: "instance".into(),
+            cwd: "/work".into(),
+        };
+        let start = json!({"hook_event_name":"SessionStart","session_id":"native",
+            "source":"startup","cwd":"/work"});
+        assert_eq!(
+            normalize(&binding, "session.start", &start).unwrap()["session_id"],
+            "native"
+        );
+        let end = json!({"hook_event_name":"SessionEnd","session_id":"native",
+            "reason":"prompt_input_exit","cwd":"/work"});
+        assert_eq!(
+            normalize(&binding, "session.end", &end).unwrap()["native"]["reason"],
+            "prompt_input_exit"
+        );
+        let mut compact = start;
+        compact["source"] = json!("compact");
+        assert!(normalize(&binding, "session.start", &compact).is_err());
+    }
+
+    #[test]
+    fn failure_callbacks_preserve_result_identity_and_register_both_routes() {
+        let document = json!({"spec":{"execution":{"default_event_budget_ms":1000},
+            "observation":{"enabled":true},"agents":{"qoder":{}},"events":{}}});
+        let step = aw_core::admission::AdmittedStep {
+            event: "tool.after".into(),
+            step_id: "record".into(),
+            provider: "fixture".into(),
+            event_tools: vec!["*".into()],
+            step_tools: vec!["*".into()],
+            on_error: "report".into(),
+            execution: aw_core::admission::StepExecution::Provider {
+                operation: "record".into(),
+                effects: vec!["observe".into()],
+            },
+        };
+        let (settings, _) = generate(
+            json!({}),
+            &document,
+            "qoder",
+            &[step],
+            Path::new("/aw"),
+            Path::new("/binding"),
+        )
+        .unwrap();
+        assert_eq!(
+            settings["hooks"]["PostToolUseFailure"],
+            settings["hooks"]["PostToolUse"]
+        );
+        let (reload, _) = reload::generate(
+            json!({}),
+            Path::new("/aw"),
+            Path::new("/binding"),
+            Some(true),
+        )
+        .unwrap();
+        assert_eq!(
+            reload["hooks"]["PostToolUseFailure"][0]["hooks"][0]["args"][0],
+            "bridge"
+        );
+        let context = NativeContext {
+            target: "qoder".into(),
+            instance_id: "instance".into(),
+            cwd: "/tmp".into(),
+        };
+        let mut native = json!({"hook_event_name":"PostToolUseFailure","cwd":"/tmp",
+            "session_id":"session","tool_use_id":"call","tool_name":"Bash","tool_input":{},
+            "error":"failed","is_interrupt":false});
+        let event = normalize(&context, "tool.after", &native).unwrap();
+        assert_eq!(
+            event["tool"]["result"],
+            json!({"is_error":true,"error":"failed","is_interrupt":false})
+        );
+        assert_eq!(
+            crate::association::association(
+                "qoder",
+                &event,
+                Some(native.to_string().as_bytes()),
+                |bytes| serde_json::from_slice(bytes).ok()
+            )["status"],
+            "verified"
+        );
+        assert!(normalize(&context, "tool.before", &native).is_err());
+        native.as_object_mut().unwrap().remove("error");
+        assert!(normalize(&context, "tool.after", &native).is_err());
+    }
+
+    use aw_core::admission::{AdmittedStep, StepExecution};
+
+    fn qoder_step(event: &str, step_tools: Vec<&str>, on_error: &str) -> AdmittedStep {
+        AdmittedStep {
+            event: event.into(),
+            step_id: "scan-code".into(),
+            provider: "security".into(),
+            event_tools: vec!["*".into()],
+            step_tools: step_tools.into_iter().map(Into::into).collect(),
+            on_error: on_error.into(),
+            execution: StepExecution::Provider {
+                operation: "scan_code".into(),
+                effects: vec!["observe".into(), "block".into()],
+            },
+        }
+    }
+
+    #[test]
+    fn static_qoder_matcher_preserves_wildcard_for_validation_and_failure_audit() {
+        let doc = json!({
+            "spec": {
+                "execution": {"default_event_budget_ms": 2000},
+                "agents": {"qoder": {"adapter": "qoder"}},
+                "events": {}
+            }
+        });
+        let report_exact = [qoder_step(
+            "tool.before",
+            vec!["native:qoder:Bash"],
+            "report",
+        )];
+        let (settings, _) = generate(
+            json!({}),
+            &doc,
+            "qoder",
+            &report_exact,
+            Path::new("/aw"),
+            Path::new("/binding.json"),
+        )
+        .unwrap();
+        assert_eq!(settings["hooks"]["PreToolUse"][0]["matcher"], "*");
+
+        let block_exact = [qoder_step(
+            "tool.before",
+            vec!["native:qoder:Bash"],
+            "block",
+        )];
+        let (block_settings, _) = generate(
+            json!({}),
+            &doc,
+            "qoder",
+            &block_exact,
+            Path::new("/aw"),
+            Path::new("/binding.json"),
+        )
+        .unwrap();
+        assert_eq!(block_settings["hooks"]["PreToolUse"][0]["matcher"], "*");
+
+        let mut observed_doc = doc.clone();
+        observed_doc["spec"]["agents"]["qoder"]["evidence"] = json!({"mode": "metadata_only"});
+        let (observed_settings, _) = generate(
+            json!({}),
+            &observed_doc,
+            "qoder",
+            &report_exact,
+            Path::new("/aw"),
+            Path::new("/binding.json"),
+        )
+        .unwrap();
+        assert_eq!(observed_settings["hooks"]["PreToolUse"][0]["matcher"], "*");
+
+        let wildcard = [qoder_step(
+            "tool.before",
+            vec!["execute_shell_command"],
+            "report",
+        )];
+        let (fallback_settings, _) = generate(
+            json!({}),
+            &doc,
+            "qoder",
+            &wildcard,
+            Path::new("/aw"),
+            Path::new("/binding.json"),
+        )
+        .unwrap();
+        assert_eq!(fallback_settings["hooks"]["PreToolUse"][0]["matcher"], "*");
+    }
 }

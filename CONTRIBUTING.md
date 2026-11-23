@@ -17,12 +17,11 @@ updates.
 
 ## Recommended contribution directions
 
-If you are looking for a contribution direction, we recommend starting with the
-component topics in [Community Roadmap](https://github.com/agentic-os-org/ANOLISA/discussions/categories/community-roadmap).
+If you are looking for a contribution direction, start with [Ways to Contribute](contribute/en/tracks.md) to pick a track that fits your background and environment, or explore component topics in [Community Roadmap](https://github.com/agentic-os-org/ANOLISA/discussions/categories/community-roadmap).
+For community roles, decision tiers, and component lifecycle rules, see [Community Governance](GOVERNANCE.md).
 Bug reports, bug fixes, and other Issues and PRs are also welcome.
 
-Roadmap topics are candidate directions, not scheduling commitments or tasks
-available to claim. To implement a roadmap direction, follow the Issue process:
+Roadmap topics list candidate directions; scope and claiming happen on the corresponding Issue. See [Issues, Roadmap, and Claiming Workflow](contribute/en/workflow.md) for the full label and `/claim` guide, or follow these steps:
 
 1. Search for an existing Issue covering the direction. If none exists, open an
    Issue linking to the source Discussion and describe the proposed scope.
@@ -43,15 +42,18 @@ scopes are used in commit subjects and PR titles.
 | Component | Path | Platform | Build name | Scope | Development entry and minimum local gate |
 | --- | --- | --- | --- | --- | --- |
 | cosh-ng | `src/cosh-ng/` | Linux full; macOS limited functionality | `cosh-ng` | `cosh-ng` | `cd src/cosh-ng`; `cargo build --workspace`, `cargo fmt --all -- --check`, then run the closest targeted test described in `src/cosh-ng/CONTRIBUTING.md` |
-| agent-sec-core | `src/agent-sec-core/` | Linux only | `sec-core` | `sec-core` | Python 3.11.6 and `uv`; `make build-all`, `make test` |
-| agentsight | `src/agentsight/` | Linux full eBPF; macOS `trace`/`serve` only | `sight` | `sight` | Linux uses `make build-all`; macOS uses `make build-mac`; Linux runs `make lint`, `make test` |
+| agent-sec-core | `src/agent-sec-core/` | Linux only | `agent-sec-core` (`sec-core`) | `sec-core` | V2 Rust CLI/daemon and sandbox: `make build`, `make test-rust-v2` (no `uv` or fixed Python runtime required); Python-specific tests use Python 3.11.6 and `uv` |
+| agentsight | `src/agentsight/` | Linux full eBPF; macOS `trace`/`serve` only | `agentsight` (`sight`) | `sight` | Linux uses `make build-all`; macOS uses `make build-mac`; Linux runs `make lint`, `make test` |
 | tokenless | `src/tokenless/` | Linux for full development; macOS x64/arm64 for shipped CLI binaries and npm adapters | `tokenless` | `tokenless` | `make build`, `make lint`, `make test` |
-| agent-memory | `src/agent-memory/` | Linux only | `memory` | `memory` | `make build`, `make fmt-check`, `make lint`, `make test`; use `make smoke` for MCP changes |
-| os-skills | `src/os-skills/` | Assets are cross-platform; individual scripts declare limits | `skills` | `skill` | Static Markdown skill definitions and shell assets; `make build` confirms that no compilation step is required |
+| agent-memory | `src/agent-memory/` | Linux only | `agent-memory` (`memory`) | `memory` | `make build`, `make fmt-check`, `make lint`, `make test`; use `make smoke` for MCP changes |
+| os-skills | `src/os-skills/` | Assets are cross-platform; individual scripts declare limits | `os-skills` (`skills`) | `skill` | Python 3.6+ for source installation; no compilation; run the [component regression tests](#skill-regression-tests-and-path-ownership) with Python 3.11 |
 | anolisa | `distribution/anolisa/` | Linux and macOS arm64 | n/a | `anolisa` | `cargo fmt --all --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --locked` |
-| SkillFS | `src/skillfs/` | Linux only | n/a | `skillfs` | `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`; run `scripts/test.sh` for FUSE changes |
+| SkillFS | `src/skillfs/` | Linux only | `skillfs` | `skillfs` | `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`; run `scripts/test.sh` for FUSE changes |
 | ws-ckpt | `src/ws-ckpt/` | Linux only | `ws-ckpt` | `ckpt` | `make build`, `make test` |
 | ktuner | `src/ktuner/` | Linux only | n/a | `ktuner` | `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` |
+| aw | `src/aw/` | Linux only | `aw` | `aw` | From repo root: `python3 src/aw/scripts/check.py` (toolchain pinned by `src/aw/rust-toolchain.toml`) |
+
+Concrete AW Providers live in [`providers/`](providers/README.md) (each with its own workspace, contract tests, and optional `--component aw-provider-<name>` build target). Cross-component evaluation runners live in [`benchmark/`](benchmark/README.md) (scope `benchmark`).
 
 `tokenless` can publish macOS artifacts, but its binaries are cross-compiled
 from Linux. Do not use a macOS checkout as the tokenless build environment.
@@ -65,8 +67,12 @@ The Linux-only components must be built and tested on Linux. `cosh-ng` and
 - The stable Rust toolchain for Rust components. Follow a component's
   `AGENTS.md` when it pins a toolchain or adds native libraries.
 - Python **3.11.6** and [uv](https://docs.astral.sh/uv/) for
-  `agent-sec-core`. `os-skills` is primarily static Markdown and shell data;
-  it does not own the repository Python environment.
+  `agent-sec-core` Python-specific tests and tooling (the V2 Rust build and
+  `make test-rust-v2` do not require `uv` or a fixed Python runtime). The
+  `os-skills` source installer and release-catalog tools
+  require Python **3.6+** with its standard library; select a source-install
+  interpreter with `PYTHON3=/path/to/python3`. Component regression tests use
+  Python **3.11** in a separate virtual environment.
 - `clang` and `libbpf` headers when changing `agentsight` eBPF probes.
 
 ## Fork and create a branch
@@ -114,42 +120,40 @@ boundaries, explain the contract and test impact in the PR.
 
 ### Unified build
 
-`scripts/build-all.sh` is a Linux convenience entry point. Select the maintained
-components you need with repeated `--component` options: `skills`, `sec-core`,
-`tokenless`, `ws-ckpt`, `memory`, `cosh-ng`, and `sight`.
+`scripts/build-all.sh` is the native Linux build and file installation entry point (requires Bash 4.4+). Its default stack (`--all`, or no `--component` flags) builds `cosh-ng`, `skillfs`, `ws-ckpt`, `tokenless`, `agentsight`, `agent-sec-core` (V2), and `aw`, automatically attaching matching `providers/<component>/` (`aw-provider-*`) packages. Additional selectable components are `agent-memory` and `os-skills`, with aliases `sec-core`, `sight`, `memory`, and `skills` (explicit `--component aw-provider-<name>` is also supported).
 
-The script does not build `anolisa`, `skillfs`, or `ktuner`. Use their
-component gates in the matrix above.
+The script does not build `anolisa` or `ktuner`. Use their component gates in the matrix above.
 
-With no install-mode flag, each component's install rules select paths within
-the user's home directory without elevated installation privileges. Dependency bootstrap
-may still request `sudo` for system packages. System installation uses
-`--system` or `--usr` and may require `sudo`. For development, prefer a
-targeted build with installation disabled.
+By default, `build-all.sh` uses the **system** installation profile (`PREFIX=/usr/local`) and may use `sudo` for system build packages and direct installation. Use `--user` for user-scoped paths under `$HOME/.local` (never invokes `sudo` unless `--install-system-deps` is explicitly passed; combine with `--supported-only` to skip system-only targets). Use `--prefix /usr --destdir "$PWD/target/pkgroot"` to stage package paths without `sudo`. For development, prefer a targeted build with `--no-install`.
 
 ```bash
 ./scripts/build-all.sh --help
+./scripts/build-all.sh --all --check-deps
 ./scripts/build-all.sh --no-install --component cosh-ng
-./scripts/build-all.sh --no-install --component sec-core
-./scripts/build-all.sh --no-install --component sec-core --component tokenless
+./scripts/build-all.sh --no-install --component agent-sec-core --component tokenless
+./scripts/build-all.sh --all --user --supported-only
 ```
 
 The main options are:
 
 | Option | Effect |
 | --- | --- |
-| `--no-install` | Install dependencies and build, then skip installation. |
-| `--install-mode <mode>` | Select `user` or `system`; `user` is the default. |
-| `--usr`, `--system` | Select system installation mode. |
+| `--all` | Select default components and their matching AW Providers. |
+| `--component <name>` | Build one supported component (or `aw-provider-<name>`); repeat for multiple components. |
+| `--no-install` | Prepare dependencies and build without installing files. |
+| `--install` | Prepare, build, and install files (default). |
+| `--system`, `--user` | Select the system (`/usr/local`, default) or user (`$HOME/.local`) installation profile. |
+| `--supported-only` | With `--user`, filter to user-installable components and report skipped targets. |
+| `--install-mode <mode>` | Explicit `system` or `user` profile. |
+| `--prefix <path>`, `--destdir <path>` | Override target prefix or stage files under an absolute package root without `sudo`. |
+| `--deps-only`, `--check-deps` | Prepare build dependencies without compiling, or inspect dependencies without changing the host. |
 | `--ignore-deps` | Skip dependency setup and runtime verification; use only on a pre-provisioned host. |
-| `--deps-only` | Install dependencies without building. |
-| `--uninstall` | Remove installed files; combine with `--component` to target a component. |
-| `--dry-run` | Print actions without changing files or systemd state. |
-| `--interactive`, `--non-interactive` | Open the guided flow or explicitly select automation mode. |
-| `--component <name>` | Build or uninstall one supported component; repeat for multiple components. |
+| `--install-system-deps` | Explicitly allow installing native build packages in `--user` mode. |
+| `--jobs <N>` | Limit maximum Cargo build jobs per component. |
+| `--dry-run` | Print the plan without downloads or filesystem changes. |
+| `--interactive`, `--non-interactive` | Open the guided flow or explicitly select automation mode (default). |
 
-Use explicit component selections for development. See
-`./scripts/build-all.sh --help` for the complete script interface.
+Legacy `--uninstall` is rejected by `build-all.sh`; remove installed files and services using the component-specific removal procedure. Use explicit component selections for development. See `./scripts/build-all.sh --help` for the complete script interface.
 
 The `sight` selection uses the Linux eBPF build. On macOS, build AgentSight
 locally with `make build-mac` instead.
@@ -206,6 +210,37 @@ CI adds coverage, packaging, frontend, adapter, and integration jobs according
 to the changed paths. Check [`.github/workflows/ci.yaml`](.github/workflows/ci.yaml)
 when changing generated packages or framework adapters.
 
+### Skill regression tests and path ownership
+
+For contributors changing skill scripts, keep component regression tests in
+`src/os-skills/tests/`. Tests for SkillFS belong in `src/skillfs/tests/`,
+including tests of its bundled `skillfs-mount` scripts. The former
+`tests/os-skills/` directory has been consolidated into these component
+directories. Reserve repository-level `tests/` for shared test runners and
+tests that exercise multiple components.
+
+From the repository root, use Python 3.11 and a virtual environment:
+
+```bash
+python3.11 -m venv .venv
+.venv/bin/python -m pip install -r src/os-skills/tests/requirements.txt
+.venv/bin/python -m unittest discover -s src/os-skills/tests -v
+.venv/bin/python -m unittest discover -s src/skillfs/tests -p 'test_skill_usage*.py' -v
+```
+
+The OS Skills suite covers skill scripts and installation/package layout.
+Its PDF regression uses the pinned PyMuPDF dependency. The SkillFS command
+above only checks the Python log-usage scripts; it does not replace the Linux
+Rust or FUSE checks. Both suites run in their component's prebuilt CI workflow.
+
+For maintainers changing component ownership, `.github/components.json`
+keeps source roots in `path_prefixes` and component-specific files outside
+those roots in `supporting_paths`. A trailing slash denotes a directory;
+other supporting paths name exact files. For example, the OS Skills prebuilt
+action and workflow belong to OS Skills, while shared build actions and release
+workflows retain their shared ownership. Update the matching component entries
+in `.github/CODEOWNERS` too; CI checks that the declarations agree.
+
 ## Commit messages
 
 Commit message rules are defined in
@@ -261,24 +296,35 @@ Before requesting review, confirm that:
 - The PR template records risk, compatibility, and rollback considerations.
 - Documentation and bilingual counterparts are updated when required.
 
+### Draft PRs and claiming
+
+Use a **Draft PR** (`isDraft=true`) for early work-in-progress or prototype
+feedback, and mark it **Ready for review** (`isDraft=false`) when it is ready
+for formal review and merge gates:
+
+- Opening a Draft PR does **not** claim or lock an issue by itself. To reserve
+  an accepted issue while iterating, comment `/claim` on the issue first (see
+  [`.github/TRIAGE.md`](.github/TRIAGE.md#claiming-community-work)).
+- Draft PRs do not enter formal code review unless you explicitly ask for early
+  feedback in a PR comment.
+- Post a short progress update if you need more time on a claimed issue, or
+  comment `/unclaim` if you can no longer continue. Maintainers may check in
+  after 7 days without visible progress and release inactive claims after 14
+  days (staying in Draft does not extend an inactive claim indefinitely).
+- When a linked issue is resolved by another PR or closed, competing
+  ready-for-review PRs are closed with a courtesy note linking the resolution;
+  unconverted Draft PRs do not block issue closure.
+
+The full normative lifecycle matrix and automation rules are defined in
+[`specs/issue-claim-and-pr-lifecycle.md`](specs/issue-claim-and-pr-lifecycle.md).
+
 ## Documentation synchronization
 
-Documentation changes must follow
-[`specs/documentation-standard.md`](specs/documentation-standard.md) and keep
-English and Chinese pages semantically equivalent. Command examples remain
-identical in both languages. The root guide stays a cross-component overview;
-long usage and architecture material belongs in the canonical locations below.
+Follow the [PR documentation update rules in §5 of the documentation standard](specs/documentation-standard.md#5-pr-documentation-update-rules)
+to identify which pages to update in the same PR. Keep English and Chinese pages
+semantically equivalent and command examples identical.
 
-| Change | Update in the same PR |
-| --- | --- |
-| CLI command or flag | Component `README.md` and the relevant `docs/user-guide/` page. |
-| Configuration option | Component `README.md` and the relevant `docs/user-guide/` page. |
-| Installation method | Shared installation/quickstart pages as applicable, the component manual, and its README. |
-| Architecture or protocol | `src/<component>/docs/design/`. |
-| New component | Root README and `NOTICE` when applicable. |
-
-Daily feature and fix PRs update README and user-guide pages. Release version
-bump PRs aggregate user-perceivable entries into `CHANGELOG*.md`.
+Release version bump PRs aggregate user-perceivable entries into `CHANGELOG*.md`.
 
 ## License
 

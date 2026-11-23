@@ -449,7 +449,7 @@ fn get_data_dir_uses_managed_dsh_override_only_in_dsh_shell() {
         home: std::sync::OnceLock::from(home.path().to_string_lossy().into_owned()),
         data_dir: std::sync::OnceLock::new(),
     };
-    let managed_stats_result = get_db_path_with(&managed_paths);
+    let managed_stats_result = get_db_path_with(&managed_paths, true);
     let managed_stash_result = get_stash_db_path_with(&managed_paths, None);
 
     unsafe {
@@ -468,7 +468,7 @@ fn get_data_dir_uses_managed_dsh_override_only_in_dsh_shell() {
         home: std::sync::OnceLock::from(home.path().to_string_lossy().into_owned()),
         data_dir: std::sync::OnceLock::new(),
     };
-    let explicit_stats_result = get_db_path_with(&explicit_paths);
+    let explicit_stats_result = get_db_path_with(&explicit_paths, true);
     let explicit_stash_result = get_stash_db_path_with(&explicit_paths, None);
 
     unsafe {
@@ -544,7 +544,7 @@ fn ensure_db_dir_creates_parent() {
 
     // ensure_db_dir is idempotent — calling it when the dir already exists
     // (which it does for most test envs) succeeds.
-    let db_path = get_db_path_with(&DatabasePathResolver::default()).unwrap();
+    let db_path = get_db_path_with(&DatabasePathResolver::default(), true).unwrap();
     let result = ensure_db_dir(&db_path);
     // With TempDbGuard the stats DB path points to a temp dir, so this succeeds.
     assert!(result.is_ok());
@@ -655,7 +655,7 @@ fn record_compression_stats_records_dryrun_mode() {
 #[test]
 fn get_db_path_returns_valid_path() {
     let _guard = match TempDbGuard::new() { Some(g) => g, None => return };
-    let db_path = get_db_path_with(&DatabasePathResolver::default());
+    let db_path = get_db_path_with(&DatabasePathResolver::default(), true);
     assert!(db_path.unwrap().ends_with("stats.db"));
 }
 
@@ -824,13 +824,17 @@ fn run_command_retrieve_invalid_hash() {
 
 #[test]
 fn run_command_retrieve_missing_hash() {
-    let _guard = match TempDbGuard::new() { Some(g) => g, None => return };
-    let result = run_command(Commands::Retrieve {
+    let Some(guard) = TempDbGuard::new() else {
+        return;
+    };
+    drop(SqliteStore::new(guard.stash_db_path()).unwrap());
+    let (message, code) = run_command(Commands::Retrieve {
         hash: "abcdef0123456789abcdef01".to_string(),
         stash_db: None,
-    });
-    assert!(result.is_err());
-    assert!(result.unwrap_err().0.contains("no stashed payload"));
+    })
+    .unwrap_err();
+    assert_eq!(code, 1);
+    assert!(message.contains("no stashed payload for hash"), "{message}");
 }
 
 #[test]
@@ -852,6 +856,67 @@ fn run_command_compress_toon_from_file() {
         min_toon_chars: MIN_TOON_CHARS,
     });
     assert!(result.is_ok());
+}
+
+// TOON spec v4.4 (toon-format 0.7) adds two encoded forms the CLI has to
+// carry end to end: nested field groups and keyed tabular maps. Encoding must
+// accept the JSON shapes that produce them, and `decompress-toon` must read
+// the resulting documents back.
+#[test]
+fn run_command_compress_toon_spec_v44_shapes() {
+    let _guard = TempDbGuard::new();
+
+    let dir = tempfile::tempdir().unwrap();
+    for (name, payload) in [
+        (
+            "nested.json",
+            r#"{"users":[{"id":1,"profile":{"name":"u1","active":true}},{"id":2,"profile":{"name":"u2","active":false}}]}"#,
+        ),
+        (
+            "keyed.json",
+            r#"{"users":{"u1":{"name":"u1","active":true},"u2":{"name":"u2","active":false}}}"#,
+        ),
+        ("empties.json", r#"{"items":[{},{}]}"#),
+    ] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, payload).unwrap();
+        let result = run_command(Commands::CompressToon {
+            file: Some(path.to_str().unwrap().to_string()),
+            agent_id: Some("agent".to_string()),
+            session_id: Some("sess".to_string()),
+            tool_use_id: Some("tool".to_string()),
+            min_toon_chars: 0,
+        });
+        assert!(result.is_ok(), "{name}: {result:?}");
+    }
+}
+
+#[test]
+fn run_command_decompress_toon_spec_v44_documents() {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, document) in [
+        (
+            "nested.toon",
+            "users[2]{id,profile{name,active}}:\n  1,u1,true\n  2,u2,false",
+        ),
+        (
+            "keyed.toon",
+            "users[2:]{name,active}:\n  u1: u1,true\n  u2: u2,false",
+        ),
+        ("empties.toon", "items[2]:\n  -\n  -"),
+        // A document a 0.5.0 producer could have left on disk.
+        (
+            "legacy.toon",
+            "users[2]:\n  - id: 1\n    profile:\n      name: u1\n  - id: 2\n    profile:\n      name: u2",
+        ),
+    ] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, document).unwrap();
+        let result = run_command(Commands::DecompressToon {
+            file: Some(path.to_str().unwrap().to_string()),
+        });
+        assert!(result.is_ok(), "{name}: {result:?}");
+    }
 }
 
 #[test]
@@ -1856,16 +1921,19 @@ fn read_input_file_missing() {
 
 
 #[test]
-fn run_command_retrieve_store_error() {
-    let _guard = match TempDbGuard::new() { Some(g) => g, None => return };
-    let result = run_command(Commands::Retrieve {
+fn run_command_retrieve_reports_missing_stash_after_rejecting_override() {
+    let Some(guard) = TempDbGuard::new() else {
+        return;
+    };
+    let (message, code) = run_command(Commands::Retrieve {
         hash: "abcdef0123456789abcdef01".to_string(),
-        stash_db: Some("/nonexistent/deep/nested/dir/stash.db".to_string()),
-    });
-    // The stash_db override gets rejected and falls back to the temp DB,
-    // where the hash does not exist.
-    assert!(result.is_err());
-    assert!(result.unwrap_err().0.contains("no stashed payload"));
+        stash_db: Some("relative/stash.db".to_string()),
+    })
+    .unwrap_err();
+    assert_eq!(code, 1);
+    assert!(message.contains("stash database not found at"), "{message}");
+    assert!(message.contains(guard.stash_db_path()), "{message}");
+    assert!(!Path::new(guard.stash_db_path()).exists());
 }
 
 #[test]
@@ -2016,4 +2084,73 @@ fn warn_soft_survives_an_unwritable_stderr() {
         libc::close(saved);
     }
     drop(dev_full);
+}
+
+/// Builds RTK arguments from string literals.
+fn rtk_args_literal(values: &[&str]) -> Vec<OsString> {
+    values.iter().map(OsString::from).collect()
+}
+
+#[test]
+fn rtk_args_consume_the_option_terminator_before_the_command() {
+    assert_eq!(
+        rtk_args(rtk_args_literal(&["--", "ls", "/tmp"])),
+        rtk_args_literal(&["ls", "/tmp"])
+    );
+    assert_eq!(
+        rtk_args(rtk_args_literal(&["--", "--version"])),
+        rtk_args_literal(&["--version"])
+    );
+    // RTK's pre-command options take no values, so the delimiter can follow one.
+    assert_eq!(
+        rtk_args(rtk_args_literal(&["-v", "--", "ls"])),
+        rtk_args_literal(&["-v", "ls"])
+    );
+    // Only the first marker is the delimiter; a second one names a command.
+    assert_eq!(
+        rtk_args(rtk_args_literal(&["--", "--", "ls"])),
+        rtk_args_literal(&["--", "ls"])
+    );
+    // A delimiter with no command leaves RTK an empty command line.
+    assert_eq!(rtk_args(rtk_args_literal(&["--"])), Vec::<OsString>::new());
+}
+
+#[test]
+fn rtk_args_keep_markers_after_the_command_and_help_flags() {
+    assert_eq!(
+        rtk_args(rtk_args_literal(&["run", "--", "echo", "hi"])),
+        rtk_args_literal(&["run", "--", "echo", "hi"])
+    );
+    assert_eq!(
+        rtk_args(rtk_args_literal(&["--version"])),
+        rtk_args_literal(&["--version"])
+    );
+    assert_eq!(
+        rtk_args(rtk_args_literal(&["--help"])),
+        rtk_args_literal(&["--help"])
+    );
+    // No delimiter: RTK still receives every argument unchanged.
+    assert_eq!(
+        rtk_args(rtk_args_literal(&["-v", "ls"])),
+        rtk_args_literal(&["-v", "ls"])
+    );
+    assert_eq!(rtk_args(rtk_args_literal(&[])), Vec::<OsString>::new());
+}
+
+#[test]
+#[cfg(unix)]
+fn rtk_args_handle_non_utf8_arguments() {
+    use std::os::unix::ffi::OsStringExt;
+
+    // A non-UTF-8 option-like argument still counts as an option; the
+    // delimiter after it is consumed without decoding the argument.
+    let non_utf8 = OsString::from_vec(vec![b'-', 0xff]);
+    assert_eq!(
+        rtk_args(vec![
+            non_utf8.clone(),
+            OsString::from("--"),
+            OsString::from("ls")
+        ]),
+        vec![non_utf8, OsString::from("ls")]
+    );
 }

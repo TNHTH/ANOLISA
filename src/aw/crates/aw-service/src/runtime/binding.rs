@@ -1,6 +1,6 @@
 //! Reserve an instance before Provider preparation and release failed reservations.
 
-use super::{Instance, Runtime, MAX_BINDINGS};
+use super::{Instance, Runtime};
 use crate::{rejected, Binding, Capabilities, Result};
 use aw_host::ProcessContext;
 use serde_json::{json, Value};
@@ -22,19 +22,38 @@ impl Runtime {
         deadline: Instant,
         cancelled: &AtomicBool,
     ) -> Result<Value> {
-        let instance_id = self.identifier()?;
+        self.bind_id(
+            self.identifier()?,
+            &self.bytes,
+            target,
+            capabilities,
+            context,
+            (deadline, cancelled),
+        )
+    }
+
+    pub(super) fn bind_id(
+        &self,
+        instance_id: String,
+        bytes: &[u8],
+        target: String,
+        capabilities: Capabilities,
+        context: ProcessContext,
+        preparation: (Instant, &AtomicBool),
+    ) -> Result<Value> {
+        let (deadline, cancelled) = preparation;
         {
             let mut instances = self
                 .instances
                 .lock()
                 .map_err(|_| rejected("state_poisoned"))?;
-            if instances.len() >= MAX_BINDINGS {
-                return Err(rejected("binding_limit"));
+            if instances.len() >= self.limits.bindings {
+                return Err(self.overload("binding_limit"));
             }
             instances.insert(instance_id.clone(), None);
         }
         let result = self.prepare(
-            &self.bytes,
+            bytes,
             &instance_id,
             &target,
             capabilities,
@@ -48,6 +67,7 @@ impl Runtime {
             {
                 Err(rejected("binding_cancelled"))
             } else {
+                self.contexts.activate(&instance_id)?;
                 Ok(host)
             }
         });
@@ -57,20 +77,9 @@ impl Runtime {
             .map_err(|_| rejected("state_poisoned"))?;
         match result {
             Ok(host) => {
-                self.contexts.activate(&instance_id)?;
                 instances.insert(
                     instance_id.clone(),
-                    Some(Instance {
-                        bytes: self.bytes.clone(),
-                        context,
-                        reload: None,
-                        policy_update: Arc::new(Mutex::new(())),
-                        host: Arc::new(host),
-                        closing: false,
-                        observation: None,
-                        hooks: Arc::new(Mutex::new(BTreeMap::new())),
-                        hook_open: Arc::new(Mutex::new(())),
-                    }),
+                    Some(Instance::prepared(bytes.to_vec(), context, host)),
                 );
                 Ok(json!(Binding {
                     identity: self.identity.clone(),
@@ -84,5 +93,61 @@ impl Runtime {
                 Err(error)
             }
         }
+    }
+}
+
+impl Instance {
+    pub(super) fn prepared(
+        bytes: Vec<u8>,
+        context: ProcessContext,
+        host: impl Into<Arc<aw_host::Host>>,
+    ) -> Self {
+        let host = host.into();
+        let routes = Self::prepare_routes(&host);
+        Self {
+            run: None,
+            native_facts: Arc::default(),
+            bytes,
+            context,
+            reload: None,
+            policy_update: Arc::new(Mutex::new(())),
+            release: Arc::new(Mutex::new(())),
+            host,
+            routes,
+            closing: false,
+            observation: None,
+            hooks: Arc::new(Mutex::new(BTreeMap::new())),
+            hook_open: Arc::new(Mutex::new(())),
+            invocations: Arc::default(),
+        }
+    }
+
+    pub(super) fn prepare_routes(
+        host: &aw_host::Host,
+    ) -> Option<Arc<aw_core::routes::PreparedRoutes>> {
+        aw_adapter::reload::scope_routes(
+            host.configuration().as_value(),
+            host.target(),
+            host.steps(),
+            host.capabilities(),
+        )
+        .ok()
+        .map(Arc::new)
+    }
+}
+
+impl Runtime {
+    pub(super) fn lifecycle_record(&self, kind: &str, id: &str, metadata: Value) -> Result<String> {
+        let key = self.identifier()?;
+        self.audit.claim(
+            &key,
+            json!({"kind":kind,"identity":self.identity,"instance_id":id,"metadata":metadata}),
+        )?;
+        let result = self
+            .audit
+            .append(&key, json!({"phase":"closed","status":"ok"}));
+        self.audit.release(&key);
+        result?;
+        Ok(key)
     }
 }

@@ -1,8 +1,11 @@
 //! One typed declaration defines the public command tree, options and help.
 
 mod confirmation;
+mod connection;
+mod descriptor;
 mod discovery;
 mod dispatch;
+mod instance;
 mod inventory;
 mod management;
 mod package;
@@ -21,7 +24,7 @@ use package::{Configure, Edit, Install, Show};
     about = "Run native Agents and manage local AW software and configuration",
     disable_help_subcommand = true,
     arg_required_else_help = true,
-    after_help = "Install accepts local unpacked bundles with manifest.json or package.json.\nCompatibility: aw install --config FILE --agent TARGET connects native Hooks;\naw serve/status/stop and aw validate remain available.\nOptions are command-local; --json is not a global output mode."
+    after_help = "Install accepts local unpacked Provider bundles with package.json.\nUse aw connect and aw disconnect for native Hooks or cooperative SDK connections.\nOptions are command-local; --json is not a global output mode."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -44,7 +47,7 @@ enum Command {
     },
     /// Launch a configured Agent; preserve its output, exit code and signals
     Run(Run),
-    /// Install a local software bundle, or retain legacy native Hook connection
+    /// Install a local Provider extension
     Install(Install),
     /// Remove selected packages or an entire installation, preserving unknown files
     Uninstall(package::Uninstall),
@@ -54,9 +57,10 @@ enum Command {
     Doctor(inventory::Query),
     /// Recover interrupted package operations from their durable local records
     Recover(management::Recover),
-    /// Connect a configured Agent's persistent native Hooks
-    #[command(subcommand)]
-    Agent(Agent),
+    /// Connect native Hooks or a cooperative SDK application
+    Connect(connection::Connect),
+    /// Disconnect an idle native process or cooperative SDK application
+    Disconnect(connection::Disconnect),
     /// Generate, inspect, validate or edit offline configuration
     #[command(subcommand)]
     Config(Config),
@@ -66,38 +70,27 @@ enum Command {
         after_help = "No system service is installed. serve runs in the foreground."
     )]
     Service(Service),
-    /// Update an opted-in idle instance's policy, not installed software
+    /// Update a supported idle instance's runtime policy
     Update(Update),
     /// Query service and optional Provider views; may execute view commands
     Inspect(Inspect),
+    /// Read one public audit page without connecting to the control socket
+    AuditExport(AuditExport),
+    /// Manage native startup assets or exchange application-owned instance JSON
+    Instance(instance::Instance),
     /// Send one operation from stdin JSON to an existing service
     Request(Request),
     /// Serve the command Provider stdin/stdout protocol
     Policy,
-    /// Compatibility alias for service serve
-    #[command(hide = true)]
-    Serve(Serve),
-    /// Compatibility alias for service status
-    #[command(hide = true)]
-    Status(Endpoint),
-    /// Compatibility alias for service stop
-    #[command(hide = true)]
-    Stop(Endpoint),
-    /// Compatibility alias for config validate
-    #[command(hide = true)]
-    Validate(Validate),
     /// Internal native callback protocol
     #[command(hide = true)]
     Hook(Hook),
     /// Internal reloadable native lifecycle protocol
     #[command(hide = true)]
     Bridge(Bridge),
-}
-
-#[derive(Subcommand, Debug, PartialEq)]
-enum Agent {
-    /// Connect supported native Hooks; does not install Agent software
-    Connect(Native),
+    /// Internal resident SDK task lifecycle protocol
+    #[command(hide = true)]
+    Scope(Scope),
 }
 
 #[derive(Subcommand, Debug, PartialEq)]
@@ -112,12 +105,20 @@ enum Service {
 
 #[derive(Subcommand, Debug, PartialEq)]
 enum Config {
-    /// Create a configuration from installed Preview packages
-    Init(Configure),
+    /// Compile SDK wiring hints without starting an Agent, service or Provider
+    Descriptor(descriptor::Options),
+    /// Show redacted native source declarations; does not load or activate them
+    NativeSources(package::NativeSources),
+    /// Record a native source reference without opening the native source
+    AddNativeSource(package::AddNativeSource),
+    /// Remove a reference while retaining the original native source
+    RemoveNativeSource(package::RemoveNativeSource),
+    /// Create an offline configuration with optional Provider templates
+    Init(Box<Configure>),
     /// Print configuration JSON, including private Provider values
     Show(Show),
     /// Check configuration; optionally compare a policy update's scope
-    Validate(ManagedValidate),
+    Validate(Validate),
     /// Add a complete Provider definition without starting a service
     AddProvider(Edit),
     /// Remove an unreferenced Provider definition
@@ -190,29 +191,32 @@ struct Validate {
     /// Baseline for policy-only scope comparison; does not activate changes
     #[arg(long, value_name = "BASELINE_FILE")]
     against: Option<String>,
-}
-
-#[derive(Args, Debug, PartialEq)]
-struct ManagedValidate {
-    #[command(flatten)]
-    validation: Validate,
     #[command(flatten)]
     output: crate::output::Options,
 }
 
 #[derive(Args, Debug, PartialEq)]
 struct Update {
-    #[command(flatten)]
-    endpoint: Endpoint,
+    /// Original launch configuration; defaults to aw.yaml without --socket
+    #[arg(
+        long,
+        default_value = "aw.yaml",
+        value_name = "FILE",
+        conflicts_with = "socket"
+    )]
+    config: String,
+    /// Explicit service socket; requires a separate --policy
+    #[arg(long, value_name = "ABS_PATH", requires = "policy")]
+    socket: Option<String>,
     /// Select a configured target; combine with --instance to disambiguate
     #[arg(long, value_name = "TARGET", required_unless_present = "instance")]
     agent: Option<String>,
     /// Select an instance, optionally intersecting --agent
     #[arg(long, value_name = "ID", required_unless_present = "agent")]
     instance: Option<String>,
-    /// Candidate policy document; does not replace the launch configuration
+    /// Separate candidate; defaults to --config for an existing connection
     #[arg(long, value_name = "FILE")]
-    policy: String,
+    policy: Option<String>,
     /// Optimistic concurrency precondition; no automatic retry on conflict
     #[arg(long, value_name = "SHA256")]
     expected_revision: Option<String>,
@@ -258,13 +262,31 @@ struct Hook {
     on_error: String,
     #[arg(long, value_parser = ["true"])]
     close_event: Option<String>,
+    #[arg(long, hide = true, value_parser = ["true"])]
+    event_receipt: Option<String>,
+}
+
+#[derive(Args, Debug, PartialEq)]
+struct Scope {
+    #[command(flatten)]
+    bridge: Bridge,
+    #[arg(long, value_parser = ["open", "acknowledge", "close", "invoke"])]
+    action: String,
+    #[arg(long)]
+    event: Option<String>,
+    #[arg(long)]
+    step: Option<String>,
+    #[arg(long)]
+    on_error: Option<String>,
 }
 
 pub(crate) fn run(arguments: Vec<String>) -> crate::cli::Result<crate::cli::Exit> {
-    if let Some(protocol) = arguments
-        .first()
-        .filter(|name| matches!(name.as_str(), "hook" | "bridge"))
-    {
+    if let Some(protocol) = arguments.first().filter(|name| {
+        matches!(
+            name.as_str(),
+            "hook" | "bridge" | "scope" | "qoder-bootstrap" | "codex-hook"
+        )
+    }) {
         // Native callbacks have fail-closed replies and exit codes even for
         // malformed arguments. Keep their exact parser and protocol boundary.
         return crate::runtime(
@@ -311,4 +333,17 @@ pub(crate) fn run(arguments: Vec<String>) -> crate::cli::Result<crate::cli::Exit
             }
         }
     }
+}
+
+#[derive(Args, Debug, PartialEq)]
+struct AuditExport {
+    /// Existing private service state directory; reads its retained journal
+    #[arg(long, value_name = "ABS_DIR")]
+    state_dir: String,
+    /// Bounded JSON request file; does not accept a control operation
+    #[arg(long, value_name = "ABS_FILE")]
+    request: String,
+    /// Cooperative read deadline in milliseconds
+    #[arg(long, default_value_t = 5000, value_parser = clap::value_parser!(u64).range(1..=60000))]
+    timeout_ms: u64,
 }

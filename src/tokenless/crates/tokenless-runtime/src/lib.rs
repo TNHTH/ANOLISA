@@ -10,11 +10,11 @@ use std::time::Duration;
 
 use thiserror::Error;
 use tokenless_ccr::{SqliteStore, StashStore, extract_hash, is_valid_hash};
-use tokenless_compressors::JsonCompressionConfig;
+use tokenless_compressors::{JsonCompressionConfig, numbers_are_exact};
 use tokenless_protocol::{
     Attribution as ProtocolAttribution, BeforeModelRequest, BeforeModelResponse, ContentOrigin,
-    OutputOptimization, PostToolCapabilities, PostToolRequest, PostToolResponse, PreToolRequest,
-    PreToolResponse, ResultKind, RetrieveRequest, RetrieveResponse, ToolResultStatus,
+    OutputOptimization, PostToolCapabilities, PostToolRequest, PostToolResponse, ResultKind,
+    RetrieveRequest, RetrieveResponse, ToolResultStatus,
 };
 use tokenless_schema::SchemaCompressor;
 use tokenless_stats::{
@@ -27,10 +27,7 @@ mod post_tool;
 mod taxonomy;
 
 pub use entry::{EntryOptions, EntryOutcome, dispatch_with_store, response_operation};
-use entry::{
-    before_model_with_store, post_tool_with_store, pre_tool_with_rtk,
-    retrieve_authorized_with_store,
-};
+use entry::{before_model_with_store, post_tool_with_outcomes, retrieve_authorized_with_store};
 use post_tool::{PostToolPipeline, PostToolPipelineConfig};
 
 /// Why a compression attempt did or did not replace the input: the protocol
@@ -66,10 +63,17 @@ pub struct RuntimeConfig {
     pub compression_enabled: bool,
     /// Whether search records and non-file path lists share paths. Enabled by default.
     pub search_path_sharing_enabled: bool,
-    /// Whether command-output Git diffs may omit context with original recovery. Disabled by default.
+    /// Whether command-output Git diffs may omit context with original recovery. Enabled by default.
     pub diff_compression_enabled: bool,
-    /// Whether complete HTML documents are rendered as Markdown with original recovery. Enabled by default.
+    /// Whether complete HTML documents, and HTML inside JSON string values, are rendered as
+    /// Markdown with original recovery. Enabled by default.
     pub html_extraction_enabled: bool,
+    /// Whether browser accessibility snapshots are re-encoded as record tables
+    /// with original recovery. Enabled by default.
+    pub browser_snapshot_enabled: bool,
+    /// Whether structured regions inside mixed tool outputs may be compressed
+    /// individually. Disabled by default.
+    pub mixed_content_enabled: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -80,8 +84,10 @@ impl Default for RuntimeConfig {
             sls_enabled: false,
             compression_enabled: true,
             search_path_sharing_enabled: true,
-            diff_compression_enabled: false,
+            diff_compression_enabled: true,
             html_extraction_enabled: true,
+            browser_snapshot_enabled: true,
+            mixed_content_enabled: false,
         }
     }
 }
@@ -242,39 +248,12 @@ pub enum RuntimeError {
     /// The PostTool domain compressor failed.
     #[error("{0}")]
     Pipeline(String),
-    /// PreTool was requested without a resolved RTK executable.
-    #[error("RTK executable is unavailable")]
-    RtkUnavailable,
+    /// PreTool was requested without the executable that runs rewritten RTK commands.
+    #[error("Tokenless executable for RTK commands is unavailable")]
+    RtkLauncherUnavailable,
     /// PreTool was requested without the state directory required by RTK.
     #[error("RTK state directory is unavailable")]
     RtkDataDirectoryUnavailable,
-    /// RTK could not be started.
-    #[error("failed to start RTK at '{}': {source}", path.display())]
-    RtkSpawn {
-        /// Executable selected by the caller.
-        path: PathBuf,
-        /// Process spawn failure.
-        #[source]
-        source: std::io::Error,
-    },
-    /// Waiting for RTK failed.
-    #[error("failed while waiting for RTK: {0}")]
-    RtkWait(std::io::Error),
-    /// Reading RTK output failed.
-    #[error("failed to read RTK output: {0}")]
-    RtkOutput(std::io::Error),
-    /// RTK exceeded the lifecycle timeout.
-    #[error("RTK rewrite timed out after 5 seconds")]
-    RtkTimeout,
-    /// RTK terminated without an exit code.
-    #[error("RTK rewrite terminated without an exit code")]
-    RtkTerminated,
-    /// RTK returned a code outside its documented protocol.
-    #[error("RTK rewrite exited with unexpected code {code}")]
-    RtkUnexpectedExit {
-        /// Unexpected process exit code.
-        code: i32,
-    },
 }
 
 /// Stateful Tokenless service for in-process callers.
@@ -419,8 +398,10 @@ impl TokenlessRuntime {
             search_path_sharing_enabled: self.config.search_path_sharing_enabled,
             diff_compression_enabled: self.config.diff_compression_enabled,
             html_extraction_enabled: self.config.html_extraction_enabled,
+            browser_snapshot_enabled: self.config.browser_snapshot_enabled,
+            mixed_content_enabled: self.config.mixed_content_enabled,
             stash_enabled: true,
-            rtk_path: None,
+            rtk_launcher: None,
             rtk_data_dir: None,
         };
         let outcome = before_model_with_store(request, &options, self.stash_store.as_ref())?;
@@ -435,21 +416,6 @@ impl TokenlessRuntime {
             self.config.sls_enabled,
         );
         Ok(outcome.response)
-    }
-
-    /// Runs the PreTool RTK rewrite service with a caller-resolved executable.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RuntimeError`] when RTK cannot run or violates its exit-code
-    /// contract.
-    pub fn pre_tool(
-        &self,
-        request: &PreToolRequest,
-        attribution: &ProtocolAttribution,
-        rtk_path: &Path,
-    ) -> Result<PreToolResponse, RuntimeError> {
-        pre_tool_with_rtk(request, attribution, rtk_path, &self.data_dir)
     }
 
     /// Runs PostTool routing and the content-domain pipeline.
@@ -467,11 +433,14 @@ impl TokenlessRuntime {
             search_path_sharing_enabled: self.config.search_path_sharing_enabled,
             diff_compression_enabled: self.config.diff_compression_enabled,
             html_extraction_enabled: self.config.html_extraction_enabled,
+            browser_snapshot_enabled: self.config.browser_snapshot_enabled,
+            mixed_content_enabled: self.config.mixed_content_enabled,
             stash_enabled: true,
-            rtk_path: None,
-            rtk_data_dir: None,
+            rtk_launcher: None,
+            rtk_data_dir: Some(self.data_dir.clone()),
         };
-        let outcome = post_tool_with_store(request, &options, self.stash_store.as_ref())?;
+        let outcome =
+            post_tool_with_outcomes(request, &options, self.stash_store.as_ref(), attribution)?;
         record_entry_stats(
             attribution,
             &outcome.stats,
@@ -601,7 +570,7 @@ impl TokenlessRuntime {
         if let Some(recorder) = &self.stats_recorder
             && let Err(e) = recorder.record(&record)
         {
-            warn_stats(&format!(
+            warn_soft(&format!(
                 "[tokenless-stats] WARNING: failed to record stats entry: {e}",
             ));
         }
@@ -703,7 +672,7 @@ fn finish_schema_compression(
 }
 
 /// Encode JSON as TOON and apply the shared minimum-length gate,
-/// no-savings, and dry-run policies.
+/// numeric fidelity gate, no-savings, and dry-run policies.
 ///
 /// Payloads with fewer than `min_toon_chars` characters pass through
 /// unchanged as [`Disposition::Passthrough`] because TOON savings on small
@@ -712,6 +681,11 @@ fn finish_schema_compression(
 /// yields token savings, restoring the pre-gate behavior. The input is
 /// still validated as JSON, so short invalid payloads fail instead of
 /// passing through.
+///
+/// A payload whose numbers TOON cannot carry also passes through unchanged
+/// as [`Disposition::Passthrough`], mirroring the two guards the PostTool
+/// JSON domain applies before TOON may replace exact JSON. Size alone never
+/// authorizes a lossy encoding.
 ///
 /// # Errors
 ///
@@ -732,22 +706,34 @@ pub fn compress_toon(
     // Character count, not byte length: the adapter hooks measure the same
     // threshold in Unicode code points, so CJK payloads gate identically.
     if input.chars().count() < min_toon_chars {
-        return Ok(CompressResult {
-            output: input.to_string(),
-            compressed_output: input.to_string(),
-            disposition: Disposition::Passthrough,
-            before_tokens,
-            after_tokens: before_tokens,
-            stash_writes: None,
-            stash_errors: None,
-            unrecoverable_truncations: None,
-            stash_size: None,
-        });
+        return Ok(toon_passthrough(input, before_tokens));
+    }
+    // Numeric fidelity gate, first half: decline the payload before encoding
+    // when a source literal cannot survive a `serde_json` round trip
+    // (`1e-400` underflows, `1.234567890123456789` rounds). This is the very
+    // predicate the PostTool JSON domain applies, shared through
+    // `tokenless_compressors` so the two TOON entries cannot drift apart.
+    // TOON spec v4.4 made keyed object maps and nested record arrays short
+    // enough to win the size comparison, so such payloads now reach this
+    // entry where 0.5.0 left them as JSON.
+    if !numbers_are_exact(input) {
+        return Ok(toon_passthrough(input, before_tokens));
     }
     let compressed_output = toon_format::encode_default(&value)
         .map_err(|error| RuntimeError::ToonEncode(error.to_string()))?
         .trim_end()
         .to_string();
+    // Numeric fidelity gate, second half: a candidate that does not decode
+    // back to the parsed value drops something TOON cannot represent
+    // (`-0.0` loses its sign, `1e3` returns as an integer), so the original
+    // JSON is emitted instead. An empty candidate stays on the no-savings
+    // branch below, which already reports it without claiming an encoding.
+    if !compressed_output.is_empty()
+        && !toon_format::decode_default::<serde_json::Value>(&compressed_output)
+            .is_ok_and(|decoded| decoded == value)
+    {
+        return Ok(toon_passthrough(input, before_tokens));
+    }
     let after_tokens = estimate_tokens(&compressed_output);
     let disposition = if compressed_output.is_empty() || after_tokens >= before_tokens {
         Disposition::NoSavings
@@ -774,6 +760,25 @@ pub fn compress_toon(
     })
 }
 
+/// Original-text result for a TOON attempt the policy declined to encode.
+///
+/// Both the minimum-length gate and the numeric fidelity gate report
+/// [`Disposition::Passthrough`]; callers that need to tell them apart
+/// compare the payload length against the same `min_toon_chars`.
+fn toon_passthrough(input: &str, before_tokens: usize) -> CompressResult {
+    CompressResult {
+        output: input.to_string(),
+        compressed_output: input.to_string(),
+        disposition: Disposition::Passthrough,
+        before_tokens,
+        after_tokens: before_tokens,
+        stash_writes: None,
+        stash_errors: None,
+        unrecoverable_truncations: None,
+        stash_size: None,
+    }
+}
+
 fn validate_input_size(input: &str) -> Result<(), RuntimeError> {
     if input.len() > MAX_INPUT_BYTES {
         return Err(RuntimeError::InputTooLarge {
@@ -786,12 +791,12 @@ fn validate_input_size(input: &str) -> Result<(), RuntimeError> {
 /// Best-effort stderr warning whose own write failure cannot fail the
 /// command. `eprintln!` panics when writing to stderr fails (a full
 /// filesystem behind redirected logs, a closed descriptor), which would
-/// turn a fail-soft stats-recording warning into a process failure —
-/// the stats layer must stay invisible to the compression and
+/// turn an optional-state warning into a process failure —
+/// optional state must stay invisible to the compression and
 /// retrieval results. The write errors are discarded: there is no
 /// fallback channel to report a failed warning on, and failing the
 /// command here is exactly the regression to avoid.
-pub(crate) fn warn_stats(message: &str) {
+pub(crate) fn warn_soft(message: &str) {
     use std::io::Write;
     let mut stderr = std::io::stderr();
     let _ = stderr.write_all(message.as_bytes());
@@ -850,11 +855,13 @@ pub fn compress_response_with_store(
             search_path_sharing_enabled: false,
             diff_compression_enabled: false,
             html_extraction_enabled: false,
+            browser_snapshot_enabled: false,
             stash_enabled: options.stash_enabled,
             require_reversibility: options.require_reversible,
             force_json: true,
             allow_toon: false,
             min_toon_chars: MIN_TOON_CHARS,
+            mixed_content_enabled: false,
             json: json_config(options),
         },
         stash_store,
@@ -967,7 +974,7 @@ pub fn retrieve_recorded(
             None,
             None,
         ) {
-            warn_stats(&format!(
+            warn_soft(&format!(
                 "[tokenless-stats] WARNING: failed to record retrieve event: {e}",
             ));
         }
@@ -1083,14 +1090,14 @@ fn record_entry_stats(
                         "json_truncation"
                     };
                     if let Err(e) = recorder.record_artifacts(stats_id, artifact_kind, stash_keys) {
-                        warn_stats(&format!(
+                        warn_soft(&format!(
                             "[tokenless-stats] WARNING: failed to record stash artifacts: {e}"
                         ));
                     }
                 }
             }
             Err(e) => {
-                warn_stats(&format!(
+                warn_soft(&format!(
                     "[tokenless-stats] WARNING: failed to record stats entry: {e}",
                 ));
             }
@@ -1120,12 +1127,12 @@ mod tests {
     /// able to fail the command when stderr itself cannot be written
     /// (a full filesystem behind redirected logs). `eprintln!` panics
     /// on that shape, turning the fail-soft warning into exit 101 while
-    /// the compression output is fine; `warn_stats` must survive it.
+    /// the compression output is fine; `warn_soft` must survive it.
     /// Redirect fd 2 to /dev/full, call the helper, restore, and assert
     /// the call returned — a panicking write makes this test fail.
     #[test]
     #[cfg(target_os = "linux")]
-    fn warn_stats_survives_an_unwritable_stderr() {
+    fn warn_soft_survives_an_unwritable_stderr() {
         use std::os::unix::io::AsRawFd;
 
         let dev_full = std::fs::OpenOptions::new()
@@ -1138,7 +1145,7 @@ mod tests {
             libc::dup2(dev_full.as_raw_fd(), 2);
         }
         // The helper's whole contract: no panic, error discarded.
-        warn_stats("[tokenless-stats] WARNING: simulated stderr failure");
+        warn_soft("[tokenless-stats] WARNING: simulated stderr failure");
         // Restore before any assert can print.
         let restored = unsafe { libc::dup2(saved, 2) };
         let _ = std::io::Write::flush(&mut std::io::stderr());
@@ -1696,6 +1703,134 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_sessions_keep_embedded_html_rows_and_attribution_apart() {
+        // Four hook processes sharing one state directory: each session's
+        // document repeats one shared fragment and carries its own, so the
+        // shared row is created by one session and refreshed by the others.
+        let directory = tempfile::tempdir().unwrap();
+        let fragment = |label: &str| {
+            format!(
+                "<div style=\"font-family: Arial, sans-serif; color: #333333\">\
+                 <p style=\"margin: 0 0 8px 0\"><span style=\"font-weight: normal\">{label}: \
+                 approve the refund before</span> <strong>2024-06-01</strong>.</p>\
+                 <ul style=\"padding-left: 16px; margin: 0\"><li style=\"margin: 0\">\
+                 <a href=\"https://example.com/{label}\" target=\"_blank\" \
+                 rel=\"noopener noreferrer\">Reference</a></li></ul></div>"
+            )
+        };
+        let barrier = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for session in 0..4 {
+                let (directory, barrier) = (directory.path(), &barrier);
+                scope.spawn(move || {
+                    let runtime = TokenlessRuntime::new(RuntimeConfig {
+                        data_dir: Some(directory.to_path_buf()),
+                        stats_enabled: true,
+                        ..RuntimeConfig::default()
+                    })
+                    .unwrap();
+                    let attribution = ProtocolAttribution {
+                        agent_id: "qwenwork".to_owned(),
+                        session_id: Some(format!("session-{session}")),
+                        tool_use_id: Some(format!("call-{session}")),
+                    };
+                    let own = fragment(&format!("session-{session}"));
+                    let content = serde_json::to_string(&serde_json::json!({
+                        "session": session,
+                        "shared": fragment("shared"),
+                        "own": own,
+                    }))
+                    .unwrap();
+                    barrier.wait();
+                    let response = runtime
+                        .post_tool(
+                            &PostToolRequest {
+                                result_kind: ResultKind::Tool,
+                                tool_name: "fetch_record".to_owned(),
+                                content,
+                                status: ToolResultStatus::Success,
+                                content_origin: ContentOrigin::ApiResponse,
+                                command: None,
+                                output_optimization: OutputOptimization::None,
+                                capabilities: PostToolCapabilities {
+                                    replace_output: true,
+                                    recovery: tokenless_protocol::RecoveryMethod::Shell,
+                                    replace_with_text: false,
+                                },
+                            },
+                            &attribution,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        response.applied_operations,
+                        [tokenless_protocol::AppliedOperation::HtmlExtraction]
+                    );
+                    let output: serde_json::Value = serde_json::from_str(&response.output).unwrap();
+                    assert_eq!(output["session"], session);
+                    for (field, expected) in [("shared", fragment("shared")), ("own", own)] {
+                        let text = output[field].as_str().unwrap();
+                        let hash = tokenless_ccr::recovery_hashes(
+                            text,
+                            &tokenless_protocol::RecoveryMethod::Shell,
+                        )[0];
+                        let restored = runtime
+                            .retrieve_authorized(
+                                &RetrieveRequest {
+                                    hash_or_marker: hash.to_owned(),
+                                    visible_markers: vec![text.to_owned()],
+                                },
+                                &attribution,
+                            )
+                            .unwrap();
+                        assert_eq!(restored.payload, expected);
+                    }
+                });
+            }
+        });
+
+        let recorder = StatsRecorder::new(directory.path().join("stats.db")).unwrap();
+        for session in 0..4 {
+            let records = recorder
+                .records_by_session(&format!("session-{session}"), None)
+                .unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(
+                records[0].tool_use_id.as_deref(),
+                Some(format!("call-{session}").as_str())
+            );
+            assert_eq!(records[0].content_type.as_deref(), Some("json"));
+            assert_eq!(
+                records[0].applied_operations,
+                Some(vec!["html_extraction".to_owned()])
+            );
+        }
+        let connection = rusqlite::Connection::open(directory.path().join("stats.db")).unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT session_id, tool_use_id, COUNT(*) FROM retrieve_events \
+                 WHERE outcome = 'hit' GROUP BY session_id, tool_use_id ORDER BY session_id",
+            )
+            .unwrap();
+        let events = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            events,
+            (0..4)
+                .map(|session| (format!("session-{session}"), format!("call-{session}"), 2))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn schema_compression_is_reversible_and_attributed() {
         let directory = tempfile::tempdir().unwrap();
         let runtime = TokenlessRuntime::new(RuntimeConfig {
@@ -1835,17 +1970,20 @@ mod tests {
             search_path_sharing_enabled: config.search_path_sharing_enabled,
             diff_compression_enabled: config.diff_compression_enabled,
             html_extraction_enabled: config.html_extraction_enabled,
+            browser_snapshot_enabled: config.browser_snapshot_enabled,
+            mixed_content_enabled: config.mixed_content_enabled,
             stash_enabled: true,
-            rtk_path: None,
+            rtk_launcher: None,
             rtk_data_dir: None,
         }
     }
 
     #[test]
-    fn html_rendering_is_on_and_diff_cropping_off_by_default() {
+    fn html_rendering_and_diff_cropping_are_on_by_default() {
         let config = RuntimeConfig::default();
         assert!(config.html_extraction_enabled);
-        assert!(!config.diff_compression_enabled);
+        assert!(config.diff_compression_enabled);
+        assert!(config.browser_snapshot_enabled);
     }
 
     #[test]
@@ -2002,6 +2140,79 @@ mod tests {
         // The same contract holds with the gate disabled.
         let error = compress_toon("not json", true, 0).unwrap_err();
         assert!(matches!(error, RuntimeError::InvalidJson(_)));
+    }
+
+    /// 40 uniform records keyed by ID: the shape TOON spec v4.4 encodes as a
+    /// keyed tabular map, short enough to win the size comparison where 0.5.0
+    /// expanded every entry into an indented block longer than compact JSON.
+    fn keyed_records(ratio: &str) -> String {
+        let entries = (0..40)
+            .map(|index| {
+                let ratio = if index == 3 { ratio } else { "0.5" };
+                format!(r#""u{index}":{{"name":"user{index}","active":true,"ratio":{ratio}}}"#)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(r#"{{"users":{{{entries}}}}}"#)
+    }
+
+    #[test]
+    fn toon_declines_numbers_it_cannot_retain() {
+        // The control proves this shape really does reach TOON, so every
+        // rejection below is the numeric gate rather than a size accident.
+        let clean = keyed_records("0.5");
+        assert!(clean.chars().count() >= MIN_TOON_CHARS);
+        let control = compress_toon(&clean, true, MIN_TOON_CHARS).unwrap();
+        assert!(control.applied());
+        assert!(control.after_tokens < control.before_tokens);
+
+        // `1e-400` underflows, `1.234567890123456789` rounds and
+        // `18446744073709551617` exceeds `u64`, so the literal scan rejects
+        // all three. `-0.0` and `1e3` survive the scan and are caught only by
+        // the decode round trip: TOON writes them as `0` and `1000`, losing
+        // the sign and the float type.
+        for ratio in [
+            "1e-400",
+            "-0.0",
+            "1e3",
+            "1.234567890123456789",
+            "18446744073709551617",
+        ] {
+            let input = keyed_records(ratio);
+            let result = compress_toon(&input, true, MIN_TOON_CHARS).unwrap();
+            assert_eq!(
+                result.disposition,
+                Disposition::Passthrough,
+                "ratio {ratio} must not be encoded"
+            );
+            assert_eq!(result.output, input, "ratio {ratio} must survive verbatim");
+            assert_eq!(
+                result.compressed_output, input,
+                "ratio {ratio} must not report a candidate"
+            );
+            assert_eq!(result.before_tokens, result.after_tokens, "ratio {ratio}");
+        }
+    }
+
+    #[test]
+    fn toon_numeric_gate_also_governs_dry_run() {
+        // Dry run predicts what an enabled run would emit, so a payload the
+        // gate declines must not be booked as a predicted saving either.
+        let input = keyed_records("1e-400");
+        let result = compress_toon(&input, false, MIN_TOON_CHARS).unwrap();
+        assert_eq!(result.disposition, Disposition::Passthrough);
+        assert_eq!(result.output, input);
+        assert_eq!(result.compressed_output, input);
+    }
+
+    #[test]
+    fn toon_numeric_gate_ignores_the_length_override() {
+        // `min_toon_chars = 0` opts out of the length gate only. A caller
+        // asking for short payloads to be encoded still gets exact numbers.
+        let input = r#"{"a":[1e-400,1e-400,1e-400]}"#;
+        let result = compress_toon(input, true, 0).unwrap();
+        assert_eq!(result.disposition, Disposition::Passthrough);
+        assert_eq!(result.output, input);
     }
 
     #[test]

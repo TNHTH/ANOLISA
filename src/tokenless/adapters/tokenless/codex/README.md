@@ -24,7 +24,7 @@ The plugin registers four hooks with Codex:
    blocks a tool. Re-enabling the retained legacy pipeline requires a source
    change and a new release.
 3. **`PreToolUse` (rewrite)** — runs before shell command execution:
-   - Rewrites commands via `rtk rewrite` for token optimization
+   - Rewrites commands through Tokenless PreTool (`tokenless compress`)
    - Only applies to Bash/Shell/terminal/programmatic tools
 4. **`PostToolUse`** — runs after every tool execution:
    - Skips content-reading and task-management tools
@@ -40,7 +40,7 @@ The plugin registers four hooks with Codex:
 
 ### Prerequisites
 
-- Rust toolchain ≥ 1.89.0
+- Rust toolchain ≥ 1.91.0
 - The `anolisa` source tree (this repository)
 
 ### Install
@@ -68,8 +68,15 @@ Or install from the marketplace (once published).
 
 ```bash
 ./scripts/detect.sh
-# {"installed": true, "version": "1.0.0", "path": "/home/user/.local/bin/tokenless"}
+# {
+#   "installed": true,
+#   "version": "0.1.0",
+#   "path": "/home/user/.local/bin/tokenless"
+# }
 ```
+
+`jq` and the no-`jq` fallback both print this object. A missing or
+non-running CLI prints `{"installed": false}`.
 
 ## Hook Output Format
 
@@ -112,7 +119,7 @@ tokenless stats show <id>
 ```
 Shell command
     │
-    ├─ PreToolUse: rtk rewrite
+    ├─ PreToolUse: tokenless PreTool
     │   └─ Replaces the command with an output-reducing equivalent
     │
     ├─ Tool execution

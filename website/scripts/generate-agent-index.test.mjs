@@ -86,12 +86,12 @@ enum Commands {
   return {root, paths, files};
 }
 
-function generate(root) {
+function generate(root, env = {}) {
   const result = spawnSync(process.execPath, [path.join(root, 'website/scripts/generate-agent-index.mjs')], {
     cwd: root,
     encoding: 'utf8',
     timeout: 30_000,
-    env: {...process.env, GITHUB_SHA: 'fixture-commit', SITE_URL: 'https://example.com', BASE_URL: '/'},
+    env: {...process.env, GITHUB_SHA: 'fixture-commit', SITE_URL: 'https://example.com', BASE_URL: '/', ...env},
   });
   assert.ifError(result.error);
   return result;
@@ -111,8 +111,11 @@ for (const migrated of [false, true]) {
       assert.equal(components[id].source_path, sourcePath);
       assert.equal(components[id].documentation_path, `https://github.com/agentic-os-org/ANOLISA/tree/main/${sourcePath}`);
     }
-    assert.equal(index.schema_version, '1.3.0');
+    assert.equal(index.schema_version, '1.4.0');
     assert.equal(index.install.cli, installCommand);
+    assert.equal(index.contribution.guide_url, 'https://example.com/docs/contribute/');
+    assert.equal(index.contribution.governance_url, 'https://example.com/docs/contribute/governance/');
+    assert.equal(index.contribution.claim_command, '/claim');
     assert.equal(components.anolisa.install, installCommand);
     assert.equal(components.anolisa.install_method, 'bootstrap');
     if (!migrated) {
@@ -171,6 +174,65 @@ for (const migrated of [false, true]) {
     assert.equal(changelog, changelogSources.flatMap((source) => [
       `===== ${source} =====`, '', files[source], '',
     ]).join('\n'));
+  });
+
+  test(`includes current English contributor guides with ${migrated ? 'migrated' : 'legacy'} component paths`, async (t) => {
+    const {root, paths} = await createFixture(t, migrated);
+    const contributorFiles = {
+      'contribute/en/aw/building.md': '# Build AW\n\nAW build instructions.\n',
+      'contribute/en/cosh-ng/testing.md': '# Test cosh-ng\n\nShell test instructions.\n',
+      'CONTRIBUTING.md': '# Contribute\n\nRepository contribution requirements.\n',
+      'GOVERNANCE.md': '# Governance\n\nCommunity governance rules.\n',
+      'specs/issue-claim-and-pr-lifecycle.md': '# Claim & PR Lifecycle\n\nNormative claim and Draft PR rules.\n',
+      [`${paths.anolisa}/CONTRIBUTING.md`]: '# Distribution contributor instructions\n',
+      [`${paths.tokenless}/CONTRIBUTING.md`]: '# Contribute to Tokenless\n',
+      [`${paths['copilot-shell']}/CONTRIBUTING.md`]: '# Shell contributor instructions\n',
+    };
+    const excludedFiles = {
+      'CONTRIBUTING_zh.md': '# Chinese repository contribution requirements\n',
+      'GOVERNANCE_zh.md': '# Chinese governance rules\n',
+      'specs/issue-claim-and-pr-lifecycle_zh.md': '# Chinese claim lifecycle companion\n',
+      'contribute/zh/aw/building.md': '# Chinese AW build instructions\n',
+      [`${paths.tokenless}/CONTRIBUTING_zh.md`]: '# Chinese Tokenless contribution requirements\n',
+      'src/unlisted/CONTRIBUTING.md': '# Unlisted component contribution requirements\n',
+      'deprecated/unlisted/CONTRIBUTING.md': '# Archived contribution requirements\n',
+    };
+    for (const [source, content] of Object.entries({...contributorFiles, ...excludedFiles})) {
+      const target = path.join(root, source);
+      await mkdir(path.dirname(target), {recursive: true});
+      await writeFile(target, content);
+    }
+
+    const baseUrl = migrated ? '/ANOLISA/' : '/';
+    const result = generate(root, {BASE_URL: baseUrl});
+    assert.equal(result.status, 0, result.stderr);
+    const output = path.join(root, 'website/.generated/static');
+    const index = JSON.parse(await readFile(path.join(output, 'agents/repo-index.json'), 'utf8'));
+    const fullDocumentation = await readFile(path.join(output, 'llms-full.txt'), 'utf8');
+    const currentContributors = Object.entries(contributorFiles)
+      .filter(([source]) => !source.startsWith('deprecated/'));
+    const bySource = (left, right) => left.source.localeCompare(right.source);
+    assert.deepEqual(index.documentation.slice(4).sort(bySource), currentContributors.map(([source]) => ({
+      source,
+      url: `https://github.com/agentic-os-org/ANOLISA/blob/main/${source}`,
+    })).sort(bySource));
+    assert.equal(new Set(index.documentation.map(({source}) => source)).size, index.documentation.length);
+    for (const [source, content] of currentContributors) {
+      assert.ok(fullDocumentation.includes(`===== ${source} =====\n\n${content}`), source);
+    }
+    for (const source of [...Object.keys(excludedFiles),
+      ...(migrated ? [`${paths['copilot-shell']}/CONTRIBUTING.md`] : [])]) {
+      assert.ok(!index.documentation.some((document) => document.source === source), source);
+      assert.ok(!fullDocumentation.includes(`===== ${source} =====`), source);
+    }
+    const llmsIndex = await readFile(path.join(output, 'llms.txt'), 'utf8');
+    assert.ok(llmsIndex.includes(`- Contribute: https://example.com${baseUrl}docs/contribute/\n`));
+    assert.ok(llmsIndex.includes(`- Ways to contribute: https://example.com${baseUrl}docs/contribute/tracks/\n`));
+    assert.ok(llmsIndex.includes(`- Governance: https://example.com${baseUrl}docs/contribute/governance/\n`));
+    assert.ok(llmsIndex.includes(`- Community roadmap: ${index.repository}/discussions/categories/community-roadmap\n`));
+    const textIndex = await readFile(path.join(output, 'agents/repo-index.txt'), 'utf8');
+    assert.ok(textIndex.includes('## Contribution & governance\n'));
+    assert.ok(textIndex.includes(`Governance: https://example.com${baseUrl}docs/contribute/governance/\n`));
   });
 }
 

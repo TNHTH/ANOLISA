@@ -14,7 +14,7 @@ import { createHash } from "node:crypto";
 import { McpStdioClient } from "./mcp-client.js";
 import { resolveConfig, type AgentMemoryConfig } from "./config.js";
 import { looksLikePromptInjection, wrapMemoryResultsForPrompt } from "./safety.js";
-import { buildRecallQueries, MAX_RESULTS, RRF_K } from "./keyword-extract.js";
+import { buildRecallQueries, MAX_RESULTS, RecallRankFusion } from "./keyword-extract.js";
 import {
   AGENT_MEMORY_CORPUS,
   fromCorpusReadHandle,
@@ -28,13 +28,69 @@ type PluginApiWithDisposal = OpenClawPluginApi & {
   lifecycle?: { onDispose?: (cleanup: () => Promise<void>) => () => void };
 };
 
-// Module-scoped singleton client. OpenClaw may call register() again
-// during a plugin hot-reload without firing gateway_stop for the old
-// instance, which previously left an orphan agent-memory subprocess
-// holding the sqlite/git locks. Re-register tears the prior one down
-// first (fire-and-forget — the new client must not wait on stale
-// shutdown for its lazy-start to begin).
+/** Whether a registration mode owns the long-lived client.
+ *
+ *  The host contract decides this, not a heuristic: `full` is documented as
+ *  "live runtime activation; long-lived side effects may start", while
+ *  `discovery` is documented as "read-only capability discovery; skip
+ *  sockets/workers/clients". The map is exhaustive over the SDK's
+ *  `PluginRegistrationMode` union, so a mode added by a future host fails to
+ *  compile here instead of silently becoming an owner.
+ */
+type RegistrationMode = NonNullable<OpenClawPluginApi["registrationMode"]>;
+const OWNS_CLIENT_BY_MODE: Record<RegistrationMode, boolean> = {
+  full: true,
+  discovery: false,
+  "tool-discovery": false,
+  "setup-only": false,
+  "setup-runtime": false,
+  "cli-metadata": false,
+};
+
+// Module-scoped singleton client, owned by the `full` registration. OpenClaw
+// may call register() again during a plugin hot-reload without firing
+// gateway_stop for the old instance, which previously left an orphan
+// agent-memory subprocess holding the sqlite/git locks. That reaping belongs
+// to hosts without instance disposal; see the guards in register().
 let activeClient: McpStdioClient | null = null;
+
+/**
+ * Whether this registration owns the long-lived client.
+ *
+ * OpenClaw 2026.9.2 performs a `tool-discovery` load and a `discovery` load
+ * per agent turn, each calling register() with its own session id, and keeps
+ * dispatching to the handlers of the earlier `full` instance. Only a `full`
+ * registration may therefore reap the previous client or take its place: a
+ * read-only load that did either would retire a client the gateway is still
+ * calling, or hide the live one behind a client nothing dispatches to.
+ *
+ * A host that omits the field predates it and registers once, so it owns.
+ */
+function ownsLongLivedClient(api: OpenClawPluginApi): boolean {
+  const mode = api.registrationMode as RegistrationMode | undefined;
+  if (mode === undefined) {
+    // A host that omits the field predates it and registers once, so it owns.
+    return true;
+  }
+  // An object literal inherits Object.prototype, so a mode named "toString"
+  // or "__proto__" would read an inherited member instead of undefined and
+  // skip the warning below, silently reporting a registered-but-unknown
+  // mode as owning.
+  const owns = Object.hasOwn(OWNS_CLIENT_BY_MODE, mode)
+    ? OWNS_CLIENT_BY_MODE[mode]
+    : undefined;
+  if (owns === undefined) {
+    // The map is exhaustive over the pinned union, so only a mode a *newer*
+    // host introduced reaches this line. Say so: falling back silently would
+    // give up the orphan-subprocess and index.lock protection stopStaleClient
+    // exists for, with nothing in the log to explain why.
+    api.logger.warn?.(
+      `agent-memory: unknown registration mode "${mode}" — treating it as non-owning, so a stale client will not be reaped`,
+    );
+    return false;
+  }
+  return owns;
+}
 
 /** Stop the client a previous register() left running, if any.
  *
@@ -51,7 +107,8 @@ let activeClient: McpStdioClient | null = null;
  *  behind those locks.
  *
  *  Fire-and-forget, as before: the replacement client starts lazily and
- *  must not wait on a stale shutdown to begin. */
+ *  must not wait on a stale shutdown to begin. Reached only from hosts
+ *  without instance disposal — see the guard in register(). */
 function stopStaleClient(api: OpenClawPluginApi): void {
   if (!activeClient) return;
   const stale = activeClient;
@@ -63,7 +120,7 @@ function stopStaleClient(api: OpenClawPluginApi): void {
   api.logger.warn?.(
     "agent-memory: previous client still active during register() — tearing it down (hot-reload?)",
   );
-  stale.stop().catch((err: unknown) => {
+  stale.dispose().catch((err: unknown) => {
     api.logger.warn?.(
       `agent-memory: stale-client teardown failed (${err instanceof Error ? err.message : String(err)})`,
     );
@@ -77,15 +134,38 @@ export default definePluginEntry({
     "Persistent memory backed by the agent-memory MCP server with namespace isolation and openat2 sandbox.",
   kind: "memory",
   register(api: OpenClawPluginApi) {
-    stopStaleClient(api);
+    const lifecycle = (api as PluginApiWithDisposal).lifecycle;
+    const ownsClient = ownsLongLivedClient(api);
+
+    // Two conditions decide whether this registration reaps the client of the
+    // one it replaces, and both must hold. A host that exposes instance
+    // disposal retires the instance itself, so reaping here would retire the
+    // client that host is still dispatching to. A read-only load never owns
+    // the long-lived client in the first place — OpenClaw 2026.9.2 issues one
+    // per agent turn — so it must not reap either, on any host.
+    if (ownsClient && !lifecycle?.onDispose) {
+      stopStaleClient(api);
+    }
 
     const config: AgentMemoryConfig = resolveConfig(api);
 
+    // A read-only registration is never the one that reaps: nothing may dispose
+    // a client the host can still dispatch that registration's handlers to.
+    // Nothing is stranded by that. `setup-only`, `setup-runtime` and
+    // `cli-metadata` get no capability handlers at all — the SDK gates the whole
+    // block, `registerTool` included, on `capabilityHandlers` — so no tool of
+    // theirs is reachable and the lazy client never starts: its constructor only
+    // stores the config. `discovery` and `tool-discovery` do get handlers, and
+    // their gateway_stop cleanup retires the client below. If a `tool-discovery`
+    // registration never receives `gateway_stop`, its client is never retired;
+    // that risk is accepted, and nothing bounds it.
     const client = new McpStdioClient(config);
-    activeClient = client;
+    if (ownsClient) {
+      activeClient = client;
+    }
 
     api.logger.info(
-      `agent-memory: plugin registered (binary=${config.binaryPath}, uid=${config.userId}, profile=${config.profile}, session=${config.sessionId})`,
+      `agent-memory: plugin registered (mode=${api.registrationMode ?? "unset"}, binary=${config.binaryPath}, uid=${config.userId}, profile=${config.profile}, session=${config.sessionId})`,
     );
 
     // Register memory capability so this plugin can own the memory slot.
@@ -150,34 +230,17 @@ export default definePluginEntry({
           // progressively shorter query candidates, execute every
           // candidate, and merge the results so that no topic is
           // silently dropped by an early-break optimisation.  See
-          // keyword-extract.ts for the extraction logic.
+          // keyword-extract.ts for the extraction and rank-fusion contract.
           const queryCandidates = buildRecallQueries(userMessage);
 
-          // Reciprocal-rank fusion (RRF) across all candidates.
-          //
-          // Raw BM25 scores from different queries are NOT comparable
-          // (different IDF, term counts, corpus coverage).  Instead we
-          // assign each hit an RRF score: sum of 1/(RRF_K + rank) where
-          // rank is the hit's 1-based position within its own candidate
-          // result set.  This makes scores comparable across candidates.
-          //
-          // Deduplication is by memory path (stable identity).  A single
-          // failing candidate (e.g. query > 1024 bytes) does NOT discard
-          // previously merged results.  Final result count is capped at
-          // MAX_RESULTS (5).
-          interface RrfEntry {
-            hit: Record<string, unknown>;
-            rrfScore: number;
-            bestContribution: number;
-          }
-          const pathToEntry = new Map<string, RrfEntry>();
+          const ranking = new RecallRankFusion();
 
           for (const query of queryCandidates) {
             let rawText: string;
             try {
               rawText = await client.callToolByName("memory_search", {
                 query,
-                top_k: 5,
+                top_k: MAX_RESULTS,
                 mode: "bm25",
               });
             } catch (candidateErr) {
@@ -198,38 +261,10 @@ export default definePluginEntry({
               continue;
             }
             if (!Array.isArray(batch)) continue;
-            // Within this candidate, hits are already sorted by BM25
-            // score.  Assign RRF score based on rank (0-based index,
-            // so rank 0 → contribution 1/(k+1), rank 1 → 1/(k+2), etc).
-            for (let rank = 0; rank < batch.length; rank++) {
-              const hit = batch[rank] as Record<string, unknown>;
-              const rrfContribution = 1 / (RRF_K + rank + 1);
-              const hitPath = String(hit.path ?? "");
-              const key = hitPath || JSON.stringify(hit);
-              const existing = pathToEntry.get(key);
-              if (existing) {
-                existing.rrfScore += rrfContribution;
-                // Keep the hit from the candidate where it ranked
-                // highest (largest contribution = lowest rank).
-                if (rrfContribution > existing.bestContribution) {
-                  existing.hit = hit;
-                  existing.bestContribution = rrfContribution;
-                }
-              } else {
-                pathToEntry.set(key, {
-                  hit,
-                  rrfScore: rrfContribution,
-                  bestContribution: rrfContribution,
-                });
-              }
-            }
+            ranking.addBatch(batch);
           }
 
-          // Sort by RRF score descending and limit to MAX_RESULTS.
-          const finalHits = Array.from(pathToEntry.values())
-            .sort((a, b) => b.rrfScore - a.rrfScore)
-            .slice(0, MAX_RESULTS)
-            .map((entry) => entry.hit);
+          const finalHits = ranking.results();
 
           if (finalHits.length === 0) {
             api.logger.info?.(
@@ -276,19 +311,34 @@ export default definePluginEntry({
         async execute(_toolCallId: string, params: Record<string, unknown>) {
           try {
             const text = await client.callTool("anolisa_memory_search", params);
+            let parsedArray = false;
             let count = 0;
             let suspiciousCount = 0;
             try {
               const parsed = JSON.parse(text);
               if (Array.isArray(parsed)) {
+                parsedArray = true;
                 count = parsed.length;
                 suspiciousCount = parsed.filter(
-                  (h: Record<string, unknown>) => h.suspicious === true,
+                  (h: Record<string, unknown>) => h && h.suspicious === true,
                 ).length;
               }
             } catch {
               // Server returned a non-JSON string (e.g. when the index
-              // is disabled). Leave count at 0 rather than guess.
+              // is disabled). Leave parsedArray false so it is suppressed below.
+            }
+            if (parsedArray && count === 0) {
+              return {
+                content: [{ type: "text", text: "(no matching memories found)" }],
+                details: {
+                  debug: {
+                    backend: "agent-memory",
+                    effectiveMode: (params.mode as string) || "bm25",
+                  },
+                  count: 0,
+                  suspiciousCount: 0,
+                },
+              };
             }
             // Wrap results through the safety module for prompt-injection
             // isolation. The wrapper escapes content and adds an untrusted-
@@ -442,10 +492,10 @@ export default definePluginEntry({
       { names: ["memory_get_context"] },
     );
 
-    // Return the stop promise so the host waits for the subprocess to exit.
+    // Return the disposal promise so the host waits for the subprocess to exit.
     const cleanup = async () => {
       try {
-        await client.stop();
+        await client.dispose();
       } catch (err: unknown) {
         api.logger.warn?.(
           `agent-memory: subprocess cleanup error (${err instanceof Error ? err.message : String(err)})`,
@@ -456,7 +506,6 @@ export default definePluginEntry({
         }
       }
     };
-    const lifecycle = (api as PluginApiWithDisposal).lifecycle;
     if (lifecycle?.onDispose) {
       // Reload and gateway shutdown can overlap and dispatch gateway_stop
       // again after this instance retires. Let instance disposal own cleanup
@@ -468,6 +517,7 @@ export default definePluginEntry({
 
     // ── Auto-capture: persist notable observations after each turn ──
     let lastCaptureHash = "";
+    const pendingCaptureHashes = new Set<string>();
     api.on(
       "agent_end",
       async (
@@ -505,8 +555,7 @@ export default definePluginEntry({
             .update(contentStr)
             .digest("hex")
             .slice(0, 16);
-          if (hash === lastCaptureHash) return;
-          lastCaptureHash = hash;
+          if (hash === lastCaptureHash || pendingCaptureHashes.has(hash)) return;
 
           // Trigger-based filtering: only capture when the assistant
           // mentions decisions, findings, preferences, or notable items.
@@ -532,11 +581,25 @@ export default definePluginEntry({
             return;
           }
 
-          await client.callTool("memory_observe", {
-            content,
-            hint: `auto-capture-${hash}`,
-          });
-          api.logger.info?.("agent-memory: auto-captured observation");
+          // A dedicated tool lets older servers reject this request instead
+          // of silently treating an unknown capture flag as a manual write.
+          // Keep overlapping hooks deduplicated without remembering a denied
+          // or failed attempt as a successful capture on a later turn.
+          pendingCaptureHashes.add(hash);
+          try {
+            const result = await client.callTool("memory_capture", {
+              content,
+              hint: `auto-capture-${hash}`,
+            });
+            if (result.startsWith("observed at ")) {
+              lastCaptureHash = hash;
+              api.logger.info?.("agent-memory: auto-captured observation");
+            } else if (result === "automatic capture skipped by consent") {
+              api.logger.debug?.("agent-memory: auto-capture skipped by consent");
+            }
+          } finally {
+            pendingCaptureHashes.delete(hash);
+          }
         } catch (err) {
           api.logger.warn?.(
             `agent-memory: auto-capture hook failed (${err instanceof Error ? err.message : String(err)})`,

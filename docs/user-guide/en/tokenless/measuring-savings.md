@@ -170,7 +170,10 @@ The value-preserving implementation at commit `daf42d758` (PR #8814) produces
 the following reference snapshot. The fixture bytes are unchanged from the
 Tokenless 0.8.2 snapshot at `a30575361`. The compact response is now a preservation
 control: all 20,813 bytes survive, so JSON-only savings are 0.0%, down from 36.3%
-when diagnostic fields were deleted. A separate rate regression test pretty-prints
+when diagnostic fields were deleted. The snapshot also carries the `toon-format`
+0.7.0 upgrade (TOON spec v4.4), which lifts only the TOON rows: encoding the
+uncompressed canonical response saves 17.6% instead of 17.0%, and the full stack
+19.5% instead of 18.8%. A separate rate regression test pretty-prints
 the same values and verifies actual compaction without omissions; focused suites
 cover record reduction and string, array, and depth bounds.
 
@@ -178,7 +181,7 @@ cover record reduction and string, array, and depth bounds.
 |---|---|---:|
 | `canonical.response.savings_pct` | Response compression on the canonical response | 0.0% |
 | `canonical.schema.savings_pct` | Schema compression on the canonical schema | 47.3% |
-| `canonical.response.toon_only_savings_pct` | TOON encoding of the uncompressed canonical response | 17.0% |
+| `canonical.response.toon_only_savings_pct` | TOON encoding of the uncompressed canonical response | 17.6% |
 | `canonical.schema.toon_only_savings_pct` | TOON encoding of the uncompressed canonical schema | -2.3% |
 
 The same report measures mixed-workload stacking configurations over both
@@ -191,9 +194,9 @@ rates above:
 | `response_only` | Response compression | 0.0% |
 | `schema_only` | Schema compression | 3.0% |
 | `schema_response` | Schema + response stacked | 3.0% |
-| `response_toon` | Response compression + TOON | 15.9% |
-| `toon_only` | TOON encoding of the raw payloads | 15.8% |
-| `full_stack` | Schema + response + TOON | 18.8% |
+| `response_toon` | Response compression + TOON | 16.5% |
+| `toon_only` | TOON encoding of the raw payloads | 16.3% |
+| `full_stack` | Schema + response + TOON | 19.5% |
 
 The TOON stacking rows are measured ungated (the benchmark encodes
 unconditionally); the deployed runtime adopts TOON only when it reduces the
@@ -270,7 +273,7 @@ The compression rate depends on how much removable material a payload contains, 
 - **High savings**: tools returning many uniform records (lists, tables, search results), JSON with substantial formatting or repeated structural overhead, or schemas with verbose descriptions.
 - **Moderate savings**: shell output is truncated only beyond the Layer 2 thresholds (65,536-character strings, a 128-item array head window, depth 8); below them, lossless compaction and record reduction (object arrays of at least 33 records) are what change the payload.
 - **Near-zero savings**: responses shorter than the 200-character minimum gate; already-compact JSON without redundancy; any input that does not shrink (the size guard keeps the original).
-- **Not compressed**: content-retrieval tool output (Read/Glob/Grep and the like, except the narrow native-Grep path-sharing case) and file-content results. Build/test logs, CSV/TSV tables, and supported API search listings do have their own compressors; Git diffs pass through unless the opt-in `TOKENLESS_DIFF_COMPRESSION_ENABLED` switch enables context cropping; complete HTML documents from command output or API responses are rendered as Markdown unless `TOKENLESS_HTML_EXTRACTION_ENABLED=0` disables it; other plain text, stack traces, and source code pass through unchanged for now.
+- **Not compressed**: content-retrieval tool output (Read/Glob/Grep and the like, except the narrow native-Grep path-sharing case) and file-content results. Build/test logs, CSV/TSV tables, and supported API search listings do have their own compressors; Git diff context cropping is enabled by default when output replacement and recovery are available, and `TOKENLESS_DIFF_COMPRESSION_ENABLED=0` disables it; complete HTML documents from command output or API responses are rendered as Markdown unless `TOKENLESS_HTML_EXTRACTION_ENABLED=0` disables it; Playwright MCP accessibility snapshots from command output or API responses are re-encoded as lossless TSV record tables unless `TOKENLESS_BROWSER_SNAPSHOT_ENABLED=0` disables it (chrome-devtools-mcp uid snapshots are recognized but passed through unchanged); mixed tool outputs opt into typed-region compression with `TOKENLESS_MIXED_CONTENT_ENABLED`; other plain text, stack traces, and source code pass through unchanged for now.
 
 Reference numbers always belong to the exact commit they were measured on — see [Run the repository reference workload](#run-the-repository-reference-workload) for the reproducible load, the current snapshot, and its limits. Real session savings must additionally be multiplied by the share of tool payloads in total session tokens; see [Interpret the saving rate correctly](#interpret-the-saving-rate-correctly). For the full trigger rules, see [User manual · Compression trigger conditions and thresholds](index.md#compression-trigger-conditions-and-thresholds).
 
